@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 
 // ==========================================
-// 1. CONSTANTS
+// 1. CONSTANTS & CONFIGURATION
 // ==========================================
 
 const DEFAULT_CONFIG = {
@@ -63,12 +63,13 @@ const DEFAULT_CONFIG = {
   memorySize: 256,
 };
 
-const DEFAULT_CODE = `MUL R3, R1, R2
-ADD R5, R3, R4
-ADD R7, R2, R6
-ADD R10, R8, R9
-MUL R11, R7, R10
-ADD R5, R5, R11`;
+const DEFAULT_CODE = `L.D F6, 0(R2)
+L.D F2, 8(R2)
+MUL.D F0, F2, F4
+SUB.D F8, F2, F6
+DIV.D F10, F0, F6
+ADD.D F6, F8, F2
+S.D F6, 8(R2)`;
 
 const OPCODES = [
   "L.D",
@@ -154,7 +155,7 @@ const generateInitialState = (config, codeText) => {
     }
   });
 
-  // Resolve Labels
+  // Resolve Branch Targets
   instructions.forEach((inst) => {
     if (inst.type === "BRANCH") {
       let labelTokenIdx = ["BNEZ", "BEQZ"].includes(inst.op) ? 1 : 2;
@@ -172,17 +173,14 @@ const generateInitialState = (config, codeText) => {
   for (let i = 0; i < 32; i++) regs[`R${i}`] = { val: 0, qi: null };
   for (let i = 0; i < 32; i++) regs[`F${i}`] = { val: 0.0, qi: null };
 
-  // Default Vals for Loop
-  regs["R1"].val = 32;
+  // Default Values
   regs["R2"].val = 0;
-  regs["F2"].val = 0.5;
+  regs["F4"].val = 4.0;
 
   const memory = {};
   for (let i = 0; i < config.memorySize; i += 4) memory[i] = 0;
-  memory[32] = 100;
-  memory[24] = 200;
-  memory[16] = 300;
-  memory[8] = 400;
+  memory[0] = 10.0;
+  memory[8] = 20.0;
 
   const rs = {};
   Object.keys(config.rsSize).forEach((type) => {
@@ -255,73 +253,70 @@ const reducer = (state, action) => {
       });
 
     if (writeCandidates.length > 0) {
-      // Priority Logic
-      writeCandidates.sort((a, b) => {
-        let depA = 0,
-          depB = 0;
-        Object.values(next.rs)
-          .flat()
-          .forEach((o) => {
-            if (o.busy && (o.qj === a.id || o.qk === a.id)) depA++;
-            if (o.busy && (o.qj === b.id || o.qk === b.id)) depB++;
-          });
-        if (depA !== depB) return depB - depA;
+      // Scoring
+      const scoredCandidates = writeCandidates.map((c) => {
+        let waitingCount = 0;
+        let readyCount = 0;
 
-        // Count how many would become ready
-        let readyA = 0,
-          readyB = 0;
-        Object.values(next.rs)
-          .flat()
-          .forEach((o) => {
-            if (o.busy) {
-              if (
-                (o.qj === a.id && o.qk === null) ||
-                (o.qk === a.id && o.qj === null) ||
-                (o.qj === a.id && o.qk === a.id)
-              )
-                readyA++;
-              if (
-                (o.qj === b.id && o.qk === null) ||
-                (o.qk === b.id && o.qj === null) ||
-                (o.qj === b.id && o.qk === b.id)
-              )
-                readyB++;
-            }
-          });
-        if (readyA !== readyB) return readyB - readyA;
-
-        const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
-        return p[b.type] - p[a.type];
+        if (c.type !== "STORE" && c.type !== "BRANCH") {
+          Object.values(next.rs)
+            .flat()
+            .forEach((other) => {
+              if (other.busy) {
+                const wQj = other.qj === c.id;
+                const wQk = other.qk === c.id;
+                if (wQj || wQk) {
+                  waitingCount++;
+                  if (
+                    (wQj && other.qk === null) ||
+                    (wQk && other.qj === null) ||
+                    (wQj && wQk)
+                  ) {
+                    readyCount++;
+                  }
+                }
+              }
+            });
+        }
+        const pMap = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
+        const staticPriority = pMap[c.type] || 0;
+        return { unit: c, waitingCount, readyCount, staticPriority };
       });
 
-      const winner = writeCandidates[0];
+      // Priority Sort
+      scoredCandidates.sort((a, b) => {
+        if (b.waitingCount !== a.waitingCount)
+          return b.waitingCount - a.waitingCount;
+        if (b.readyCount !== a.readyCount) return b.readyCount - a.readyCount;
+        if (b.staticPriority !== a.staticPriority)
+          return b.staticPriority - a.staticPriority;
+        return a.unit.instIdx - b.unit.instIdx; // FIFO
+      });
 
-      // Conflict Modal
-      if (writeCandidates.length > 1) {
-        const runnerUp = writeCandidates[1];
+      const winner = scoredCandidates[0].unit;
+
+      // Modal Message Logic
+      if (scoredCandidates.length > 1) {
+        const w = scoredCandidates[0];
+        const r = scoredCandidates[1];
         let reason = "";
 
-        // Re-calculate stats for reason string
-        let depW = 0,
-          depR = 0;
-        Object.values(next.rs)
-          .flat()
-          .forEach((o) => {
-            if (o.busy && (o.qj === winner.id || o.qk === winner.id)) depW++;
-            if (o.busy && (o.qj === runnerUp.id || o.qk === runnerUp.id))
-              depR++;
-          });
+        if (
+          w.waitingCount > r.waitingCount ||
+          w.readyCount > r.readyCount ||
+          w.staticPriority > r.staticPriority
+        ) {
+          reason = "Higher priority or unblocks more unit";
+        } else {
+          reason = "Issued earlier";
+        }
 
-        if (depW > depR)
-          reason = `More waiting instructions (${depW} vs ${depR}).`;
-        else reason = `Higher priority type or unblocks more units.`;
-
-        const losers = writeCandidates
+        const losers = scoredCandidates
           .slice(1)
-          .map((c) => c.op)
+          .map((c) => c.unit.op)
           .join(", ");
         next.modalMsg = {
-          title: `Write Conflict at Cycle ${next.clock}`,
+          title: `Write Conflict Cycle ${next.clock}`,
           winner: `${winner.op}`,
           losers: losers,
           reason: reason,
@@ -360,7 +355,6 @@ const reducer = (state, action) => {
       }
       next.instStatus[winner.instIdx].writeRes = next.clock;
 
-      // Reset RS
       const typeList = next.rs[winner.type];
       const rsIndex = typeList.findIndex((r) => r.id === winner.id);
       if (rsIndex !== -1) {
@@ -468,7 +462,7 @@ const reducer = (state, action) => {
         if (r1.qi || r2.qi) {
           next.stalledPc = next.pc;
         } else {
-          // Instant Execute (Bypass)
+          // Instant Execute
           let taken = false;
           const v1 = r1.val,
             v2 = r2.val;
