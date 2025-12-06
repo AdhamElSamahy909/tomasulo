@@ -106,7 +106,6 @@ S.D F6, 8(R2) `;
 
 const parseInstruction = (line) => {
   let cleanLine = line.trim().replace(/,/g, " ");
-  // Fix specific typos like "L. D" -> "L.D"
   cleanLine = cleanLine.replace(/([A-Z])\.\s+([A-Z])/gi, "$1.$2");
   cleanLine = cleanLine.replace(/\s+/g, " ");
 
@@ -139,7 +138,7 @@ const parseInstruction = (line) => {
 const toBinary32 = (num) => (num >>> 0).toString(2).padStart(32, "0");
 
 // ==========================================
-// 3. LOGIC (REDUCER)
+// 3. LOGIC & REDUCER
 // ==========================================
 
 const generateInitialState = (config, codeText) => {
@@ -246,7 +245,7 @@ const reducer = (state, action) => {
     next.stalledPc = null;
     next.modalMsg = null;
 
-    // --- 1. WRITE RESULT ---
+    // 1. WRITE RESULT (Arbitration)
     const writeCandidates = [];
     Object.values(next.rs)
       .flat()
@@ -294,11 +293,9 @@ const reducer = (state, action) => {
           });
         if (readyA !== readyB) return readyB - readyA;
 
-        // 3. Static Type
         const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
         if (p[a.type] !== p[b.type]) return p[b.type] - p[a.type];
 
-        // 4. FIFO
         return a.instIdx - b.instIdx;
       });
 
@@ -385,7 +382,7 @@ const reducer = (state, action) => {
       }
     }
 
-    // --- 2. EXECUTE ---
+    // 2. EXECUTE
     Object.values(next.rs)
       .flat()
       .forEach((u) => {
@@ -396,7 +393,9 @@ const reducer = (state, action) => {
           next.instStatus[u.instIdx].execStart = next.clock;
 
           if (u.type === "LOAD") {
+            // STEP 1: Addr Calc + Hit Time
             u.subState = "INITIAL_ACCESS";
+            // FORCE INITIAL TIME = LATENCY + HIT
             u.timer =
               (next.config.latencies[u.op] || 1) + next.config.cache.hitLatency;
           } else if (u.type === "STORE") {
@@ -435,7 +434,7 @@ const reducer = (state, action) => {
                   blk.history.push(`Miss C${next.clock}`);
                 }
               } else {
-                u.timer = next.config.cache.missPenalty; // Safe fallback
+                u.timer = next.config.cache.missPenalty;
               }
             } else if (u.subState === "MISS_PENALTY") {
               const addr = u.address;
@@ -480,7 +479,7 @@ const reducer = (state, action) => {
         }
       });
 
-    // --- 3. ISSUE ---
+    // 3. ISSUE
     if (!next.branchStall && next.pc < next.instructions.length) {
       const inst = next.instructions[next.pc];
       const getReg = (r) =>
@@ -489,8 +488,8 @@ const reducer = (state, action) => {
           : { val: parseInt(r) || 0, qi: null };
 
       if (inst.type === "BRANCH") {
-        const [op1, op2, lbl] = inst.tokens;
-        const r1 = getReg(op1);
+        const [Op1, Op2, Label] = inst.tokens;
+        const r1 = getReg(Op1);
         let r2 = { val: 0, qi: null };
         if (inst.op !== "BNEZ" && inst.op !== "BEQZ") r2 = getReg(Op2);
 
@@ -500,10 +499,10 @@ const reducer = (state, action) => {
           const val1 = r1.val;
           const val2 = r2.val;
           let taken = false;
-          if (inst.op === "BNE") taken = val1 !== val2;
-          else if (inst.op === "BEQ") taken = val1 === val2;
-          else if (inst.op === "BNEZ") taken = val1 !== 0;
-          else if (inst.op === "BEQZ") taken = val1 === 0;
+          if (inst.op === "BNE") taken = val1 !== v2;
+          else if (inst.op === "BEQ") taken = v1 === v2;
+          else if (inst.op === "BNEZ") taken = v1 !== 0;
+          else if (inst.op === "BEQZ") taken = v1 === 0;
 
           if (taken) {
             const tLabel = ["BNEZ", "BEQZ"].includes(inst.op) ? op2 : lbl;
@@ -524,7 +523,14 @@ const reducer = (state, action) => {
         if (unit) {
           unit.busy = true;
           unit.op = inst.op;
-          unit.timer = next.config.latencies[inst.op] || 1;
+          // Initial Display Timer = Config + Hit (for Load)
+          if (inst.type === "LOAD") {
+            unit.timer =
+              (next.config.latencies[inst.op] || 1) +
+              next.config.cache.hitLatency;
+          } else {
+            unit.timer = next.config.latencies[inst.op] || 1;
+          }
           unit.state = "ISSUE";
 
           const stat = {
@@ -1381,8 +1387,7 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
 // 5. MAIN COMPONENT (EXPORT)
 // ==========================================
 
-// Ensure component is defined BEFORE export
-function TomasuloSimulator() {
+const TomasuloSimulator = () => {
   const [config, setConfig] = useState(null);
   const [code, setCode] = useState(DEFAULT_CODE);
   const [state, dispatch] = useReducer(reducer, null);
@@ -1574,6 +1579,6 @@ function TomasuloSimulator() {
       </div>
     </div>
   );
-}
+};
 
 export default TomasuloSimulator;

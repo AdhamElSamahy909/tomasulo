@@ -106,6 +106,7 @@ S.D F6, 8(R2) `;
 
 const parseInstruction = (line) => {
   let cleanLine = line.trim().replace(/,/g, " ");
+  // Fix specific typos like "L. D" -> "L.D"
   cleanLine = cleanLine.replace(/([A-Z])\.\s+([A-Z])/gi, "$1.$2");
   cleanLine = cleanLine.replace(/\s+/g, " ");
 
@@ -138,7 +139,7 @@ const parseInstruction = (line) => {
 const toBinary32 = (num) => (num >>> 0).toString(2).padStart(32, "0");
 
 // ==========================================
-// 3. LOGIC & REDUCER
+// 3. LOGIC (REDUCER)
 // ==========================================
 
 const generateInitialState = (config, codeText) => {
@@ -245,7 +246,7 @@ const reducer = (state, action) => {
     next.stalledPc = null;
     next.modalMsg = null;
 
-    // 1. ARBITRATION
+    // --- 1. WRITE RESULT ---
     const writeCandidates = [];
     Object.values(next.rs)
       .flat()
@@ -258,63 +259,72 @@ const reducer = (state, action) => {
       });
 
     if (writeCandidates.length > 0) {
-      // Scoring
-      const scoredCandidates = writeCandidates.map((c) => {
-        let waitingCount = 0;
-        let readyCount = 0;
+      writeCandidates.sort((a, b) => {
+        // 1. Dep Count
+        let depA = 0,
+          depB = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy && (o.qj === a.id || o.qk === a.id)) depA++;
+            if (o.busy && (o.qj === b.id || o.qk === b.id)) depB++;
+          });
+        if (depA !== depB) return depB - depA;
 
-        if (c.type !== "STORE" && c.type !== "BRANCH") {
-          Object.values(next.rs)
-            .flat()
-            .forEach((other) => {
-              if (other.busy) {
-                const wQj = other.qj === c.id;
-                const wQk = other.qk === c.id;
-                if (wQj || wQk) {
-                  waitingCount++;
-                  if (
-                    (wQj && other.qk === null) ||
-                    (wQk && other.qj === null) ||
-                    (wQj && wQk)
-                  ) {
-                    readyCount++;
-                  }
-                }
-              }
-            });
-        }
-        const pMap = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
-        const staticPriority = pMap[c.type] || 0;
-        return { unit: c, waitingCount, readyCount, staticPriority };
+        // 2. Ready Count
+        let readyA = 0,
+          readyB = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy) {
+              if (
+                (o.qj === a.id && o.qk === null) ||
+                (o.qk === a.id && o.qj === null) ||
+                (o.qj === a.id && o.qk === a.id)
+              )
+                readyA++;
+              if (
+                (o.qj === b.id && o.qk === null) ||
+                (o.qk === b.id && o.qj === null) ||
+                (o.qj === b.id && o.qk === b.id)
+              )
+                readyB++;
+            }
+          });
+        if (readyA !== readyB) return readyB - readyA;
+
+        // 3. Static Type
+        const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
+        if (p[a.type] !== p[b.type]) return p[b.type] - p[a.type];
+
+        // 4. FIFO
+        return a.instIdx - b.instIdx;
       });
 
-      scoredCandidates.sort((a, b) => {
-        if (b.waitingCount !== a.waitingCount)
-          return b.waitingCount - a.waitingCount;
-        if (b.readyCount !== a.readyCount) return b.readyCount - a.readyCount;
-        if (b.staticPriority !== a.staticPriority)
-          return b.staticPriority - a.staticPriority;
-        return a.unit.instIdx - b.unit.instIdx;
-      });
+      const winner = writeCandidates[0];
 
-      const winner = scoredCandidates[0].unit;
+      if (writeCandidates.length > 1) {
+        const runnerUp = writeCandidates[1];
+        let reason = "Issued earlier";
+        let depW = 0,
+          depR = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy && (o.qj === winner.id || o.qk === winner.id)) depW++;
+            if (o.busy && (o.qj === runnerUp.id || o.qk === runnerUp.id))
+              depR++;
+          });
+        const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
 
-      if (scoredCandidates.length > 1) {
-        const runnerUp = scoredCandidates[1];
-        const w = scoredCandidates[0];
-        let reason = "";
-        if (
-          w.waitingCount > runnerUp.waitingCount ||
-          w.readyCount > runnerUp.readyCount ||
-          w.staticPriority > runnerUp.staticPriority
-        ) {
+        if (depW > depR) reason = "Higher priority or unblocks more unit";
+        else if (p[winner.type] > p[runnerUp.type])
           reason = "Higher priority or unblocks more unit";
-        } else {
-          reason = "Issued earlier";
-        }
-        const losers = scoredCandidates
+
+        const losers = writeCandidates
           .slice(1)
-          .map((c) => c.unit.op)
+          .map((c) => c.op)
           .join(", ");
         next.modalMsg = {
           title: `Write Conflict Cycle ${next.clock}`,
@@ -375,7 +385,7 @@ const reducer = (state, action) => {
       }
     }
 
-    // 2. EXECUTE
+    // --- 2. EXECUTE ---
     Object.values(next.rs)
       .flat()
       .forEach((u) => {
@@ -384,7 +394,12 @@ const reducer = (state, action) => {
         if (u.state === "ISSUE" && u.qj === null && u.qk === null) {
           u.state = "EXEC";
           next.instStatus[u.instIdx].execStart = next.clock;
-          if (u.type === "LOAD" || u.type === "STORE") {
+
+          if (u.type === "LOAD") {
+            u.subState = "INITIAL_ACCESS";
+            u.timer =
+              (next.config.latencies[u.op] || 1) + next.config.cache.hitLatency;
+          } else if (u.type === "STORE") {
             u.subState = "ADDR_CALC";
             u.timer = next.config.latencies[u.op] || 1;
           } else {
@@ -395,46 +410,63 @@ const reducer = (state, action) => {
 
         if (u.state === "EXEC") {
           if (u.timer > 0) u.timer--;
+
           if (u.timer === 0) {
-            if (u.subState === "ADDR_CALC") {
+            if (u.subState === "INITIAL_ACCESS") {
               u.address = (u.vj || 0) + (u.address || 0);
-              if (u.type === "LOAD") {
-                u.subState = "MEM_ACCESS";
-                const addr = u.address;
-                const rawIdx = Math.floor(addr / next.config.cache.blockSize);
-                const n = next.cache.length;
-                const blockIdx = ((rawIdx % n) + n) % n;
-                const tag = Math.floor(rawIdx / n);
-                if (next.cache[blockIdx]) {
-                  const blk = next.cache[blockIdx];
-                  if (blk.valid && blk.tag === tag) {
-                    u.timer = next.config.cache.hitLatency;
-                    blk.history.push(`Hit C${next.clock}`);
-                  } else {
-                    u.timer =
-                      next.config.cache.hitLatency +
-                      next.config.cache.missPenalty;
-                    next.cache[blockIdx] = {
-                      ...blk,
-                      valid: true,
-                      tag,
-                      data: `M[${Math.floor(addr / 8) * 8}]`,
-                      history: [...blk.history, `Miss C${next.clock}`],
-                    };
-                  }
+              const addr = u.address;
+              const rawIdx = Math.floor(addr / next.config.cache.blockSize);
+              const n = next.cache.length;
+              const blockIdx = ((rawIdx % n) + n) % n;
+              const tag = Math.floor(rawIdx / n);
+
+              if (next.cache[blockIdx]) {
+                const blk = next.cache[blockIdx];
+                const isHit = blk.valid && blk.tag === tag;
+
+                if (isHit) {
+                  blk.history.push(`Hit C${next.clock}`);
+                  u.result = next.memory[addr] ?? 0;
+                  u.state = "WRITE_READY";
+                  next.instStatus[u.instIdx].execComp = next.clock;
                 } else {
+                  u.subState = "MISS_PENALTY";
                   u.timer = next.config.cache.missPenalty;
+                  blk.history.push(`Miss C${next.clock}`);
                 }
-              } else if (u.type === "STORE") {
-                u.state = "WRITE_READY";
-                next.instStatus[u.instIdx].execComp = next.clock;
+              } else {
+                u.timer = next.config.cache.missPenalty; // Safe fallback
               }
+            } else if (u.subState === "MISS_PENALTY") {
+              const addr = u.address;
+              const rawIdx = Math.floor(addr / next.config.cache.blockSize);
+              const n = next.cache.length;
+              const blockIdx = ((rawIdx % n) + n) % n;
+              const tag = Math.floor(rawIdx / n);
+
+              next.cache[blockIdx] = {
+                ...next.cache[blockIdx],
+                valid: true,
+                tag,
+                data: `M[${Math.floor(addr / 8) * 8}]`,
+                history: [
+                  ...next.cache[blockIdx].history,
+                  `Fill C${next.clock}`,
+                ],
+              };
+
+              u.result = next.memory[addr] ?? 0;
+              u.state = "WRITE_READY";
+              next.instStatus[u.instIdx].execComp = next.clock;
+            } else if (u.subState === "ADDR_CALC") {
+              u.address = (u.vj || 0) + (u.address || 0);
+              u.state = "WRITE_READY";
+              next.instStatus[u.instIdx].execComp = next.clock;
             } else {
               u.state = "WRITE_READY";
               next.instStatus[u.instIdx].execComp = next.clock;
 
-              if (u.type === "LOAD") u.result = next.memory[u.address] ?? 0;
-              else if (["ADD.D", "ADDI", "DADDI", "DADDIU"].includes(u.op))
+              if (["ADD.D", "ADDI", "DADDI", "DADDIU"].includes(u.op))
                 u.result = (parseFloat(u.vj) || 0) + (parseFloat(u.vk) || 0);
               else if (["SUB.D", "SUBI", "DSUBI"].includes(u.op))
                 u.result = (parseFloat(u.vj) || 0) - (parseFloat(u.vk) || 0);
@@ -448,7 +480,7 @@ const reducer = (state, action) => {
         }
       });
 
-    // 3. ISSUE
+    // --- 3. ISSUE ---
     if (!next.branchStall && next.pc < next.instructions.length) {
       const inst = next.instructions[next.pc];
       const getReg = (r) =>
@@ -457,8 +489,8 @@ const reducer = (state, action) => {
           : { val: parseInt(r) || 0, qi: null };
 
       if (inst.type === "BRANCH") {
-        const [Op1, Op2, Label] = inst.tokens;
-        const r1 = getReg(Op1);
+        const [op1, op2, lbl] = inst.tokens;
+        const r1 = getReg(op1);
         let r2 = { val: 0, qi: null };
         if (inst.op !== "BNEZ" && inst.op !== "BEQZ") r2 = getReg(Op2);
 
@@ -468,10 +500,10 @@ const reducer = (state, action) => {
           const val1 = r1.val;
           const val2 = r2.val;
           let taken = false;
-          if (inst.op === "BNE") taken = v1 !== v2;
-          else if (inst.op === "BEQ") taken = v1 === v2;
-          else if (inst.op === "BNEZ") taken = v1 !== 0;
-          else if (inst.op === "BEQZ") taken = v1 === 0;
+          if (inst.op === "BNE") taken = val1 !== val2;
+          else if (inst.op === "BEQ") taken = val1 === val2;
+          else if (inst.op === "BNEZ") taken = val1 !== 0;
+          else if (inst.op === "BEQZ") taken = val1 === 0;
 
           if (taken) {
             const tLabel = ["BNEZ", "BEQZ"].includes(inst.op) ? op2 : lbl;
@@ -574,7 +606,7 @@ const reducer = (state, action) => {
 };
 
 // ==========================================
-// 4. COMPONENTS
+// 4. UI COMPONENTS
 // ==========================================
 
 const ConflictModal = ({ msg, onClose }) => {
@@ -694,6 +726,7 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
           "SD",
         ].includes(op);
         const isBZ = ["BNEZ", "BEQZ"].includes(op);
+        const isB = ["BNE", "BEQ"].includes(op);
         const isImm = [
           "ADDI",
           "SUBI",
@@ -793,12 +826,14 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
               <div className="text-gray-600 text-[10px] font-mono text-center">
                 {idx}
               </div>
+
               <input
                 placeholder="Label"
                 className="bg-transparent border border-transparent hover:border-gray-700 focus:border-blue-500 rounded px-1.5 py-1 text-xs text-yellow-500 placeholder-gray-700 outline-none transition-all font-mono"
                 value={r.label}
                 onChange={(e) => updateRow(r.id, "label", e.target.value)}
               />
+
               <div className="relative">
                 <select
                   className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-blue-300 font-bold outline-none focus:border-blue-500 cursor-pointer"
@@ -812,6 +847,7 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
                   ))}
                 </select>
               </div>
+
               <div className="relative">
                 <select
                   className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none focus:border-blue-500 cursor-pointer"
@@ -825,6 +861,7 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
                   ))}
                 </select>
               </div>
+
               {isLS ? (
                 <input
                   placeholder="Off"
@@ -852,6 +889,7 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
                   ))}
                 </select>
               )}
+
               {isLS ? (
                 <select
                   className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-400 outline-none focus:border-blue-500 cursor-pointer"
@@ -894,6 +932,7 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
                   ))}
                 </select>
               )}
+
               <button
                 onClick={() => removeRow(r.id)}
                 className="text-gray-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 flex justify-center"
@@ -1339,10 +1378,11 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
 };
 
 // ==========================================
-// 5. MAIN COMPONENT EXPORT
+// 5. MAIN COMPONENT (EXPORT)
 // ==========================================
 
-const TomasuloSimulator = () => {
+// Ensure component is defined BEFORE export
+function TomasuloSimulator() {
   const [config, setConfig] = useState(null);
   const [code, setCode] = useState(DEFAULT_CODE);
   const [state, dispatch] = useReducer(reducer, null);
@@ -1534,6 +1574,6 @@ const TomasuloSimulator = () => {
       </div>
     </div>
   );
-};
+}
 
 export default TomasuloSimulator;
