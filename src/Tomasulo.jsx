@@ -105,7 +105,6 @@ ADD.D R5, R5, R11`;
 
 const parseInstruction = (line) => {
   let cleanLine = line.trim().replace(/,/g, " ");
-  // Fix specific typos like "L. D" -> "L.D"
   cleanLine = cleanLine.replace(/([A-Z])\.\s+([A-Z])/gi, "$1.$2");
   cleanLine = cleanLine.replace(/\s+/g, " ");
 
@@ -138,7 +137,7 @@ const parseInstruction = (line) => {
 const toBinary32 = (num) => (num >>> 0).toString(2).padStart(32, "0");
 
 // ==========================================
-// 3. LOGIC (REDUCER)
+// 3. LOGIC & REDUCER
 // ==========================================
 
 const generateInitialState = (config, codeText) => {
@@ -158,7 +157,6 @@ const generateInitialState = (config, codeText) => {
     }
   });
 
-  // Resolve Branch Targets
   instructions.forEach((inst) => {
     if (inst.type === "BRANCH") {
       let labelTokenIdx = ["BNEZ", "BEQZ"].includes(inst.op) ? 1 : 2;
@@ -176,8 +174,9 @@ const generateInitialState = (config, codeText) => {
   for (let i = 0; i < 32; i++) regs[`R${i}`] = { val: 0, qi: null };
   for (let i = 0; i < 32; i++) regs[`F${i}`] = { val: 0.0, qi: null };
 
-  // Default Values
+  regs["R1"].val = 32;
   regs["R2"].val = 0;
+  regs["F2"].val = 0.5;
   regs["F4"].val = 4.0;
 
   const memory = {};
@@ -245,8 +244,7 @@ const reducer = (state, action) => {
     next.stalledPc = null;
     next.modalMsg = null;
 
-    // --- 1. WRITE RESULT (Phase 1) ---
-    // Process units that reached WRITE_READY in previous cycles
+    // 1. WRITE RESULT (Arbitration)
     const writeCandidates = [];
     Object.values(next.rs)
       .flat()
@@ -259,63 +257,70 @@ const reducer = (state, action) => {
       });
 
     if (writeCandidates.length > 0) {
-      // Scoring
-      const scoredCandidates = writeCandidates.map((c) => {
-        let waitingCount = 0;
-        let readyCount = 0;
+      writeCandidates.sort((a, b) => {
+        // 1. Dep Count
+        let depA = 0,
+          depB = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy && (o.qj === a.id || o.qk === a.id)) depA++;
+            if (o.busy && (o.qj === b.id || o.qk === b.id)) depB++;
+          });
+        if (depA !== depB) return depB - depA;
 
-        if (c.type !== "STORE" && c.type !== "BRANCH") {
-          Object.values(next.rs)
-            .flat()
-            .forEach((other) => {
-              if (other.busy) {
-                const wQj = other.qj === c.id;
-                const wQk = other.qk === c.id;
-                if (wQj || wQk) {
-                  waitingCount++;
-                  if (
-                    (wQj && other.qk === null) ||
-                    (wQk && other.qj === null) ||
-                    (wQj && wQk)
-                  ) {
-                    readyCount++;
-                  }
-                }
-              }
-            });
-        }
-        const pMap = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
-        const staticPriority = pMap[c.type] || 0;
-        return { unit: c, waitingCount, readyCount, staticPriority };
+        // 2. Ready Count
+        let readyA = 0,
+          readyB = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy) {
+              if (
+                (o.qj === a.id && o.qk === null) ||
+                (o.qk === a.id && o.qj === null) ||
+                (o.qj === a.id && o.qk === a.id)
+              )
+                readyA++;
+              if (
+                (o.qj === b.id && o.qk === null) ||
+                (o.qk === b.id && o.qj === null) ||
+                (o.qj === b.id && o.qk === b.id)
+              )
+                readyB++;
+            }
+          });
+        if (readyA !== readyB) return readyB - readyA;
+
+        const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
+        if (p[a.type] !== p[b.type]) return p[b.type] - p[a.type];
+
+        return a.instIdx - b.instIdx;
       });
 
-      scoredCandidates.sort((a, b) => {
-        if (b.waitingCount !== a.waitingCount)
-          return b.waitingCount - a.waitingCount;
-        if (b.readyCount !== a.readyCount) return b.readyCount - a.readyCount;
-        if (b.staticPriority !== a.staticPriority)
-          return b.staticPriority - a.staticPriority;
-        return a.unit.instIdx - b.unit.instIdx;
-      });
+      const winner = writeCandidates[0];
 
-      const winner = scoredCandidates[0].unit;
+      if (writeCandidates.length > 1) {
+        const runnerUp = writeCandidates[1];
+        let reason = "Issued earlier";
+        let depW = 0,
+          depR = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy && (o.qj === winner.id || o.qk === winner.id)) depW++;
+            if (o.busy && (o.qj === runnerUp.id || o.qk === runnerUp.id))
+              depR++;
+          });
+        const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
 
-      if (scoredCandidates.length > 1) {
-        const runnerUp = scoredCandidates[1];
-        const w = scoredCandidates[0];
-        let reason = "";
-        if (
-          w.waitingCount > runnerUp.waitingCount ||
-          w.readyCount > runnerUp.readyCount ||
-          w.staticPriority > runnerUp.staticPriority
-        ) {
+        if (depW > depR) reason = "Higher priority or unblocks more unit";
+        else if (p[winner.type] > p[runnerUp.type])
           reason = "Higher priority or unblocks more unit";
-        } else {
-          reason = "Issued earlier";
-        }
-        const losers = scoredCandidates
+
+        const losers = writeCandidates
           .slice(1)
-          .map((c) => c.unit.op)
+          .map((c) => c.op)
           .join(", ");
         next.modalMsg = {
           title: `Write Conflict Cycle ${next.clock}`,
@@ -376,20 +381,20 @@ const reducer = (state, action) => {
       }
     }
 
-    // --- 2. EXECUTE (Phase 2) ---
+    // 2. EXECUTE
     Object.values(next.rs)
       .flat()
       .forEach((u) => {
         if (!u.busy) return;
 
-        // ISSUE -> EXEC Transition
         if (u.state === "ISSUE" && u.qj === null && u.qk === null) {
           u.state = "EXEC";
           next.instStatus[u.instIdx].execStart = next.clock;
 
           if (u.type === "LOAD") {
-            // STEP 1: Addr Calc + Hit Time (Initial Assumption)
+            // STEP 1: Addr Calc + Hit Time
             u.subState = "INITIAL_ACCESS";
+            // FORCE INITIAL TIME = LATENCY + HIT
             u.timer =
               (next.config.latencies[u.op] || 1) + next.config.cache.hitLatency;
           } else if (u.type === "STORE") {
@@ -406,7 +411,6 @@ const reducer = (state, action) => {
 
           if (u.timer === 0) {
             if (u.subState === "INITIAL_ACCESS") {
-              // Initial calc done. CHECK CACHE.
               u.address = (u.vj || 0) + (u.address || 0);
               const addr = u.address;
               const rawIdx = Math.floor(addr / next.config.cache.blockSize);
@@ -419,13 +423,13 @@ const reducer = (state, action) => {
                 const isHit = blk.valid && blk.tag === tag;
 
                 if (isHit) {
-                  // HIT: Done.
                   blk.history.push(`Hit C${next.clock}`);
                   u.result = next.memory[addr] ?? 0;
                   u.state = "WRITE_READY";
                   next.instStatus[u.instIdx].execComp = next.clock;
                 } else {
-                  // MISS
+                  u.subState = "MISS_PENALTY";
+                  u.timer = next.config.cache.missPenalty;
                   blk.history.push(`Miss C${next.clock}`);
 
                   // If miss penalty is zero, complete the fill immediately
@@ -449,10 +453,9 @@ const reducer = (state, action) => {
                   }
                 }
               } else {
-                u.timer = next.config.cache.missPenalty; // Safe fallback
+                u.timer = next.config.cache.missPenalty;
               }
             } else if (u.subState === "MISS_PENALTY") {
-              // Penalty Done. Fill Cache.
               const addr = u.address;
               const rawIdx = Math.floor(addr / next.config.cache.blockSize);
               const n = next.cache.length;
@@ -478,7 +481,6 @@ const reducer = (state, action) => {
               u.state = "WRITE_READY";
               next.instStatus[u.instIdx].execComp = next.clock;
             } else {
-              // Normal ALU
               u.state = "WRITE_READY";
               next.instStatus[u.instIdx].execComp = next.clock;
 
@@ -496,7 +498,7 @@ const reducer = (state, action) => {
         }
       });
 
-    // --- 3. ISSUE (Phase 3) ---
+    // 3. ISSUE
     if (!next.branchStall && next.pc < next.instructions.length) {
       const inst = next.instructions[next.pc];
       const getReg = (r) =>
@@ -513,7 +515,6 @@ const reducer = (state, action) => {
         if (r1.qi !== null || r2.qi !== null) {
           next.stalledPc = next.pc;
         } else {
-          // Instant Execute
           const val1 = r1.val;
           const val2 = r2.val;
           let taken = false;
@@ -541,8 +542,14 @@ const reducer = (state, action) => {
         if (unit) {
           unit.busy = true;
           unit.op = inst.op;
-          // Timer init moved to EXEC phase for accuracy
-          unit.timer = 1;
+          // Initial Display Timer = Config + Hit (for Load)
+          if (inst.type === "LOAD") {
+            unit.timer =
+              (next.config.latencies[inst.op] || 1) +
+              next.config.cache.hitLatency;
+          } else {
+            unit.timer = next.config.latencies[inst.op] || 1;
+          }
           unit.state = "ISSUE";
 
           const stat = {
@@ -624,7 +631,7 @@ const reducer = (state, action) => {
 };
 
 // ==========================================
-// 4. COMPONENTS
+// 4. UI COMPONENTS
 // ==========================================
 
 const ConflictModal = ({ msg, onClose }) => {
@@ -950,6 +957,7 @@ const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
                   ))}
                 </select>
               )}
+
               <button
                 onClick={() => removeRow(r.id)}
                 className="text-gray-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 flex justify-center"
