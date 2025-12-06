@@ -11,18 +11,16 @@ import {
   AlertCircle,
   Edit3,
   GitBranch,
+  Archive,
 } from "lucide-react";
 
 // --- UTILITIES & PARSING ---
 
 const PARSER_REGEX = {
-  // Matches: OP DEST, OFFSET(BASE)  -> L.D F6, 32(R2) or LW R1, 0(R2)
   MEM: /^([A-Z\.]+)\s+([RF]\d+)\s*,\s*(-?\d+)\(([RF]\d+)\)$/i,
-  // Matches: OP DEST, SRC1, SRC2    -> ADD.D F6, F2, F4  or ADDI R1, R1, #8
   ALU: /^([A-Z\.]+)\s+([RF]\d+)\s*,\s*([RF]\d+)\s*,\s*(?:#)?([RF0-9\.-]+)$/i,
-  // Matches: BNE SRC1, SRC2, LABEL  -> BNE F0, 0, L  (Allows 0 or R0)
   BRANCH: /^(BNE|BEQ)\s+([RF]\d+)\s*,\s*([RF0-9]+)\s*,\s*([A-Z0-9]+)$/i,
-  // Matches Label: -> LOOP:
+  BRANCH_Z: /^(BNEZ|BEQZ)\s+([RF]\d+)\s*,\s*([A-Z0-9]+)$/i, // Handle BNEZ R1, LOOP
   LABEL: /^([A-Z0-9]+):?/i,
 };
 
@@ -66,6 +64,17 @@ const parseInstruction = (line, index) => {
       rt: match[3],
       target: match[4],
     };
+  } else if ((match = instruction.match(PARSER_REGEX.BRANCH_Z))) {
+    return {
+      id: index,
+      label,
+      text: instruction,
+      type: "BRANCH",
+      op: match[1],
+      rs: match[2],
+      rt: null,
+      target: match[3], // RT is null for Zero check
+    };
   } else if ((match = instruction.match(PARSER_REGEX.ALU))) {
     return {
       id: index,
@@ -83,14 +92,13 @@ const parseInstruction = (line, index) => {
 };
 
 const STORE_OPS = ["S.D", "S.S", "SW", "SD"];
-const BRANCH_OPS = ["BNE", "BEQ"];
 const LOAD_OPS = ["L.D", "L.S", "LW", "LD"];
+const BRANCH_OPS = ["BNE", "BEQ", "BNEZ", "BEQZ"];
 
 // --- INITIAL CONFIGURATION ---
 
 const DEFAULT_CONFIG = {
-  robSize: 7,
-  rsSize: { ADD: 3, MULT: 2, LOAD: 3 },
+  rsSize: { ADD: 3, MULT: 2, LOAD: 3, STORE: 3 },
   latencies: {
     "L.D": 2,
     "L.S": 2,
@@ -114,6 +122,7 @@ const DEFAULT_CONFIG = {
     "DIV.S": 40,
     BNE: 1,
     BEQ: 1,
+    BNEZ: 1,
   },
   cache: {
     enabled: true,
@@ -125,14 +134,11 @@ const DEFAULT_CONFIG = {
   memorySize: 128,
 };
 
-const DEFAULT_CODE = `L.D    F0, 10(R2)
-ADD.D  F10, F4, F0
-MUL.D  F2, F10, F6
-BNE    F2, 0, L
-L.D    F4, 0(R3)
-ADD.D  F0, F4, F6
-S.D    F4, 0(R3)
-L:`;
+const DEFAULT_CODE = `LOOP: L.D   F0, 0(R1)
+      MUL.D F4, F0, F2
+      S.D   F4, 0(R1)
+      SUBI  R1, R1, 8
+      BNEZ  R1, LOOP`;
 
 // --- SIMULATOR LOGIC ---
 
@@ -148,15 +154,20 @@ const generateInitialState = (config, codeText) => {
   });
 
   const regs = {};
-  for (let i = 0; i < 32; i++) regs[`R${i}`] = { val: 0, rob: null };
-  for (let i = 0; i < 32; i++) regs[`F${i}`] = { val: 0.0, rob: null };
+  for (let i = 0; i < 32; i++) regs[`R${i}`] = { val: 0, qi: null };
+  for (let i = 0; i < 32; i++) regs[`F${i}`] = { val: 0.0, qi: null };
 
-  regs["R2"].val = 0;
-  regs["R3"].val = 0;
-  regs["F4"].val = 2.0;
-  regs["F6"].val = 4.0;
+  // Pre-load specific values for the loop trace
+  regs["R1"].val = 32; // Loop starts at address 32, decrements by 8
+  regs["F2"].val = 0.5; // Multiplier
 
-  const memoryValues = { 0: 10.5, 8: 20.25, 10: 50.0 };
+  // Init Memory with some data at the target addresses
+  const memoryValues = {
+    32: 100.0,
+    24: 200.0,
+    16: 300.0,
+    8: 400.0,
+  };
 
   const numBlocks = config.cache.size / config.cache.blockSize;
   const cacheBlocks = Array.from({ length: numBlocks }, () => ({
@@ -169,7 +180,7 @@ const generateInitialState = (config, codeText) => {
   const rs = {};
   Object.keys(config.rsSize).forEach((type) => {
     rs[type] = Array.from({ length: config.rsSize[type] }, (_, i) => ({
-      id: `${type}${i}`,
+      id: `${type}${i + 1}`,
       type,
       busy: false,
       op: "",
@@ -177,30 +188,11 @@ const generateInitialState = (config, codeText) => {
       vk: null,
       qj: null,
       qk: null,
-      dest: null,
       address: null,
       timer: 0,
       state: "IDLE",
     }));
   });
-
-  const rob = Array.from({ length: config.robSize }, (_, i) => ({
-    entry: i + 1,
-    busy: false,
-    instr: "",
-    dest: "",
-    value: null,
-    stage: "Empty",
-    address: null,
-    type: "",
-    valQ: null,
-    // Branch specific tracking within ROB (since no RS)
-    qj: null,
-    qk: null,
-    vj: null,
-    vk: null,
-    timer: 0,
-  }));
 
   return {
     clock: 0,
@@ -208,15 +200,12 @@ const generateInitialState = (config, codeText) => {
     instructions,
     labels,
     config,
-    rob,
-    robHead: 0,
-    robTail: 0,
     rs,
     regs,
     memoryValues,
     cache: cacheBlocks,
-    log: ["Simulation Ready. Branch Prediction: NOT TAKEN"],
-    flushed: false,
+    log: ["Classic Tomasulo Initialized."],
+    branchStall: false,
   };
 };
 
@@ -227,439 +216,327 @@ const reducer = (state, action) => {
   if (action.type === "STEP") {
     let next = JSON.parse(JSON.stringify(state));
     next.clock++;
-    const { config, rob, rs, regs, cache } = next;
+    const { config, rs, regs, cache } = next;
     const log = [];
 
     const addToLog = (msg) => log.unshift(`C${next.clock}: ${msg}`);
 
     // --- HELPER: CDB BROADCAST ---
-    const broadcast = (robId, value, sourceId) => {
-      const rEntry = rob.find((r) => r.entry === robId);
-      if (rEntry) {
-        rEntry.value = value;
-        rEntry.stage = "Write";
-      }
+    const broadcast = (rsId, value) => {
+      // 1. Update Register File
+      Object.keys(next.regs).forEach((regName) => {
+        if (next.regs[regName].qi === rsId) {
+          next.regs[regName].val = value;
+          next.regs[regName].qi = null;
+        }
+      });
 
-      // Update RS
+      // 2. Update Reservation Stations (Qj, Qk)
       Object.values(next.rs)
         .flat()
         .forEach((unit) => {
           if (unit.busy) {
-            if (unit.qj === robId) {
+            if (unit.qj === rsId) {
               unit.vj = value;
               unit.qj = null;
             }
-            if (unit.qk === robId) {
+            if (unit.qk === rsId) {
               unit.vk = value;
               unit.qk = null;
             }
           }
         });
 
-      // Update ROB Stores & Branches (Waiting for dependencies)
-      next.rob.forEach((r) => {
-        if (!r.busy) return;
-
-        // Stores waiting for Value
-        if (STORE_OPS.includes(r.type) && r.valQ === robId) {
-          r.value = value;
-          r.valQ = null;
-          r.stage = "Write";
-        }
-
-        // Branches waiting for Operands (qj/qk)
-        if (BRANCH_OPS.includes(r.type)) {
-          if (r.qj === robId) {
-            r.vj = value;
-            r.qj = null;
-          }
-          if (r.qk === robId) {
-            r.vk = value;
-            r.qk = null;
-          }
-        }
-      });
-
-      addToLog(`${sourceId} broadcast ${value} to ROB#${robId}`);
+      addToLog(`${rsId} broadcast ${value}`);
     };
 
-    // --- STAGE 0: RETIRE ---
-    if (rob[next.robHead].stage === "Commit") {
-      const finishedEntry = rob[next.robHead];
-      rob[next.robHead] = {
-        entry: finishedEntry.entry,
-        busy: false,
-        instr: "",
-        dest: "",
-        value: null,
-        stage: "Empty",
-        type: "",
-        address: null,
-        valQ: null,
-        qj: null,
-        qk: null,
-        vj: null,
-        vk: null,
-        timer: 0,
-      };
-      next.robHead = (next.robHead + 1) % config.robSize;
-    }
+    // --- STAGE 1: EXECUTE & WRITE RESULT ---
 
-    // --- STAGE 1: COMMIT ---
-    const headEntry = rob[next.robHead];
+    Object.keys(rs).forEach((type) => {
+      rs[type].forEach((unit) => {
+        if (!unit.busy) return;
 
-    if (headEntry.busy && headEntry.stage === "Write") {
-      headEntry.stage = "Commit";
+        // Check Operands Readiness
+        const hasOperands = unit.qj === null && unit.qk === null;
 
-      if (STORE_OPS.includes(headEntry.type)) {
-        const addr = headEntry.address;
-        const val = headEntry.value;
-        next.memoryValues[addr] = val;
+        if (unit.state === "IDLE" && hasOperands) {
+          unit.state = "EXECUTING";
 
-        const blockIndex =
-          Math.floor(addr / config.cache.blockSize) % cache.length;
-        const tag = Math.floor(addr / config.cache.blockSize);
-        if (cache[blockIndex].valid && cache[blockIndex].tag === tag) {
-          cache[blockIndex].valid = false;
+          if (type === "LOAD" || type === "STORE") {
+            // Address Calc: Base(Vj) + Offset(Address stored in Issue)
+            // Note: In Issue below, we store Imm in 'address' field initially.
+            unit.address = (unit.vj || 0) + (unit.address || 0);
+          }
         }
-        addToLog(`Committed ${headEntry.type} ${val} to Mem[${addr}]`);
-      } else if (BRANCH_OPS.includes(headEntry.type)) {
-        // PREDICT NOT TAKEN LOGIC
-        // Value 1 = Taken (Misprediction)
 
-        if (headEntry.value === 1) {
-          // Taken -> Misprediction
-          addToLog(`Branch Taken (Misprediction) -> FLUSHING`);
+        if (unit.state === "EXECUTING") {
+          // Handle Cache Latency for Loads
+          if (type === "LOAD" && unit.timer === 0) {
+            const addr = unit.address;
+            const blockIdx =
+              Math.floor(addr / config.cache.blockSize) % cache.length;
+            const tag = Math.floor(addr / config.cache.blockSize);
+            const isHit = cache[blockIdx].valid && cache[blockIdx].tag === tag;
 
-          // Restore PC to Target (saved in address field at issue)
-          next.pc = headEntry.address;
-
-          // Flush ROB
-          for (let i = 0; i < config.robSize; i++) {
-            if (i !== next.robHead) {
-              next.rob[i] = {
-                entry: i + 1,
-                busy: false,
-                instr: "",
-                dest: "",
-                value: null,
-                stage: "Empty",
-                type: "",
-                address: null,
-                valQ: null,
-                qj: null,
-                qk: null,
-                vj: null,
-                vk: null,
-              };
+            if (isHit) {
+              unit.timer = config.cache.hitLatency;
+              addToLog(`Cache HIT at ${addr}`);
+            } else {
+              unit.timer = config.cache.hitLatency + config.cache.missPenalty;
+              addToLog(`Cache MISS at ${addr}`);
+              cache[blockIdx] = { valid: true, tag, data: "Block" };
             }
           }
-          next.robTail = (next.robHead + 1) % config.robSize;
 
-          // Flush RS
-          Object.values(next.rs)
-            .flat()
-            .forEach((u) => {
-              u.busy = false;
-              u.state = "IDLE";
-            });
+          if (unit.timer > 0) unit.timer--;
 
-          // Reset RAT
-          Object.values(next.regs).forEach((r) => {
-            r.rob = null;
-          });
+          if (unit.timer === 0) {
+            let result = 0;
 
-          next.flushed = true;
-        } else {
-          addToLog(`Branch Not Taken (Correct Prediction)`);
-        }
-      } else if (headEntry.dest) {
-        if (next.regs[headEntry.dest].rob === headEntry.entry) {
-          next.regs[headEntry.dest].val = headEntry.value;
-          next.regs[headEntry.dest].rob = null;
-        }
-        addToLog(`Committed ${headEntry.instr}`);
-      }
-    }
+            // ALU Logic
+            if (type === "LOAD") result = next.memoryValues[unit.address] || 0;
+            else if (["ADD.D", "ADD.S", "ADDI", "DADDI"].includes(unit.op))
+              result = unit.vj + unit.vk;
+            else if (["SUB.D", "SUB.S", "SUBI", "DSUBI"].includes(unit.op))
+              result = unit.vj - unit.vk;
+            else if (["MUL.D", "MUL.S"].includes(unit.op))
+              result = unit.vj * unit.vk;
+            else if (["DIV.D", "DIV.S"].includes(unit.op))
+              result = unit.vj / unit.vk;
+            else if (BRANCH_OPS.includes(unit.op)) {
+              // Branch evaluation
+              if (unit.op === "BNE") result = unit.vj !== unit.vk ? 1 : 0;
+              if (unit.op === "BEQ") result = unit.vj === unit.vk ? 1 : 0;
+              if (unit.op === "BNEZ") result = unit.vj !== 0 ? 1 : 0; // Compare against 0
+            }
 
-    // --- STAGE 2: EXECUTE & WRITE RESULT (RS & Branch Logic) ---
-    if (!next.flushed) {
-      // 2a. Standard RS
-      Object.keys(rs).forEach((type) => {
-        rs[type].forEach((unit) => {
-          if (!unit.busy) return;
-
-          const hasOperands = unit.qj === null && unit.qk === null;
-
-          if (unit.state === "IDLE" && hasOperands) {
-            unit.state = "EXECUTING";
-            const rEntry = rob.find((r) => r.entry === unit.dest);
-            if (rEntry && rEntry.stage === "Issued") rEntry.stage = "Exec";
-            if (type === "LOAD") unit.address = (unit.vj || 0) + unit.vk;
+            unit.computedResult = result;
+            unit.state = "WRITE";
           }
+        }
 
-          if (unit.state === "EXECUTING") {
-            // Memory latency handled here
-            if (type === "LOAD" && unit.timer === 0) {
+        // Write Result Stage
+        if (unit.state === "WRITE") {
+          if (type === "STORE") {
+            // Store Buffer waits for Value (Vk/Qk)
+            if (unit.qk === null) {
               const addr = unit.address;
-              // ... cache logic same as before ...
+              const val = unit.vk;
+              next.memoryValues[addr] = val;
+              addToLog(`Store ${val} to Mem[${addr}]`);
+
               const blockIdx =
                 Math.floor(addr / config.cache.blockSize) % cache.length;
               const tag = Math.floor(addr / config.cache.blockSize);
-              const block = cache[blockIdx];
-              const isHit = block.valid && block.tag === tag;
-              if (isHit) unit.timer = config.cache.hitLatency;
-              else {
-                unit.timer = config.cache.hitLatency + config.cache.missPenalty;
-                cache[blockIdx] = { valid: true, tag, data: "Block" };
+              if (cache[blockIdx].valid && cache[blockIdx].tag === tag)
+                cache[blockIdx].valid = false;
+
+              unit.busy = false;
+              unit.state = "IDLE";
+            }
+          } else if (BRANCH_OPS.includes(unit.op)) {
+            // Branch Resolution
+            const taken = unit.computedResult === 1;
+            if (taken) {
+              // Unit Address holds Label Name (string) from Issue
+              if (next.labels[unit.address] !== undefined) {
+                next.pc = next.labels[unit.address];
+                addToLog(`Branch Taken -> Jump to ${unit.address}`);
+              } else {
+                addToLog(`Branch Error: Label ${unit.address} not found`);
               }
+            } else {
+              addToLog(`Branch Not Taken -> Continue`);
             }
 
-            if (unit.timer > 0) unit.timer--;
-
-            if (unit.timer === 0) {
-              let result = 0;
-              if (type === "LOAD")
-                result = next.memoryValues[unit.address] || 0;
-              else if (["ADD.D", "ADD.S", "ADDI", "DADDI"].includes(unit.op))
-                result = unit.vj + unit.vk;
-              else if (["SUB.D", "SUB.S", "SUBI", "DSUBI"].includes(unit.op))
-                result = unit.vj - unit.vk;
-              else if (["MUL.D", "MUL.S"].includes(unit.op))
-                result = unit.vj * unit.vk;
-              else if (["DIV.D", "DIV.S"].includes(unit.op))
-                result = unit.vj / unit.vk;
-
-              unit.result = result;
-              unit.state = "WRITING";
-            }
-          }
-
-          if (unit.state === "WRITING") {
-            broadcast(unit.dest, unit.result, unit.id);
+            next.branchStall = false; // Unstall Fetch
+            unit.busy = false;
+            unit.state = "IDLE";
+          } else {
+            broadcast(unit.id, unit.computedResult);
             unit.busy = false;
             unit.state = "IDLE";
           }
-        });
-      });
-
-      // 2b. Branch Execution (Inside ROB)
-      // Check for Branches in 'Issued' state that have ready operands
-      next.rob.forEach((r) => {
-        if (r.busy && BRANCH_OPS.includes(r.type) && r.stage === "Issued") {
-          // Check operands
-          if (r.qj === null && r.qk === null) {
-            // Operands Ready -> Move to Exec
-            r.stage = "Exec";
-            // Use configured branch latency
-            r.timer = config.latencies[r.type] || 1;
-          }
-        }
-
-        if (r.busy && BRANCH_OPS.includes(r.type) && r.stage === "Exec") {
-          if (r.timer > 0) r.timer--;
-          if (r.timer === 0) {
-            // Calculate Result
-            const op1 = r.vj;
-            const op2 = r.vk;
-            let taken = 0;
-            if (r.type === "BNE") taken = op1 !== op2 ? 1 : 0;
-            if (r.type === "BEQ") taken = op1 === op2 ? 1 : 0;
-
-            r.value = taken;
-            r.stage = "Write"; // Result Ready
-            addToLog(
-              `Branch ${r.type} calculated: ${
-                taken ? "Taken" : "Not Taken"
-              } (ROB#${r.entry})`
-            );
-          }
         }
       });
-    }
+    });
 
-    // --- STAGE 3: ISSUE ---
-    const robFull = next.rob.filter((r) => r.busy).length >= config.robSize;
-
-    if (!robFull && !next.flushed && next.pc < next.instructions.length) {
+    // --- STAGE 2: ISSUE ---
+    if (!next.branchStall && next.pc < next.instructions.length) {
       const inst = next.instructions[next.pc];
+
       if (inst.type === "LABEL") {
         next.pc++;
       } else {
-        const isStore = STORE_OPS.includes(inst.op);
-        const isBranch = BRANCH_OPS.includes(inst.op);
+        let type = "";
+        if (LOAD_OPS.includes(inst.op)) type = "LOAD";
+        else if (STORE_OPS.includes(inst.op)) type = "STORE";
+        else if (["MUL.D", "DIV.D", "MUL.S", "DIV.S"].includes(inst.op))
+          type = "MULT";
+        else type = "ADD";
 
-        if (isStore) {
-          const getRegVal = (regName) => {
-            if (!isNaN(regName)) return { val: parseFloat(regName), rob: null };
+        const freeIdx = next.rs[type].findIndex((u) => !u.busy);
+
+        if (freeIdx !== -1) {
+          const rsUnit = next.rs[type][freeIdx];
+          rsUnit.busy = true;
+          rsUnit.op = inst.op;
+          rsUnit.timer = config.latencies[inst.op] || 1;
+          rsUnit.state = "IDLE";
+
+          const getReg = (regName) => {
+            if (!isNaN(regName)) return { val: parseFloat(regName), qi: null };
             const r = next.regs[regName];
-            if (r.rob !== null) {
-              const robDep = next.rob.find((rb) => rb.entry === r.rob);
-              if (robDep && robDep.stage === "Write")
-                return { val: robDep.value, rob: null };
-              return { val: null, rob: r.rob };
-            }
-            return { val: r.val, rob: null };
+            return { val: r.val, qi: r.qi };
           };
 
-          const base = getRegVal(inst.rs);
+          if (type === "LOAD") {
+            const base = getReg(inst.rs);
+            rsUnit.vj = base.val;
+            rsUnit.qj = base.qi;
+            rsUnit.address = inst.imm;
+            rsUnit.vk = null;
+            rsUnit.qk = null;
+            if (inst.dest) next.regs[inst.dest].qi = rsUnit.id;
+          } else if (type === "STORE") {
+            const base = getReg(inst.rs);
+            rsUnit.vj = base.val;
+            rsUnit.qj = base.qi;
+            const src = getReg(inst.dest);
+            rsUnit.vk = src.val;
+            rsUnit.qk = src.qi;
+            rsUnit.address = inst.imm;
+          } else if (BRANCH_OPS.includes(inst.op)) {
+            const src1 = getReg(inst.rs);
+            rsUnit.vj = src1.val;
+            rsUnit.qj = src1.qi;
 
-          if (base.rob !== null) {
-            addToLog(`Stall: Waiting for Addr Base (${inst.rs})`);
-          } else {
-            const address = base.val + inst.imm;
-            const valToStore = getRegVal(inst.dest);
-
-            const robIndex = next.robTail;
-            const robEntry = next.rob[robIndex];
-
-            robEntry.busy = true;
-            robEntry.instr = inst.text;
-            robEntry.type = inst.op;
-            robEntry.dest = null;
-            robEntry.address = address;
-            robEntry.stage = "Issued";
-
-            if (valToStore.rob === null) {
-              robEntry.value = valToStore.val;
-              robEntry.valQ = null;
-              robEntry.stage = "Write";
-            } else {
-              robEntry.value = null;
-              robEntry.valQ = valToStore.rob;
-            }
-
-            next.robTail = (next.robTail + 1) % config.robSize;
-            next.pc++;
-            addToLog(`Issued ${inst.op} to ROB#${robEntry.entry}`);
-          }
-        } else if (isBranch) {
-          // --- BRANCH ISSUE (Non-Blocking) ---
-          const getRegVal = (regName) => {
-            if (!isNaN(regName)) return { val: parseFloat(regName), rob: null };
-            const r = next.regs[regName];
-            if (r.rob !== null) {
-              const robDep = next.rob.find((rb) => rb.entry === r.rob);
-              // Check if available from ROB right now
-              if (
-                robDep &&
-                (robDep.stage === "Write" || robDep.stage === "Commit")
-              )
-                return { val: robDep.value, rob: null };
-              return { val: null, rob: r.rob };
-            }
-            return { val: r.val, rob: null };
-          };
-
-          const rs1 = getRegVal(inst.rs);
-          const rs2 = getRegVal(inst.rt);
-
-          const robIndex = next.robTail;
-          const robEntry = next.rob[robIndex];
-
-          robEntry.busy = true;
-          robEntry.instr = inst.text;
-          robEntry.type = inst.op;
-          robEntry.dest = null;
-          robEntry.address = next.labels[inst.target];
-          robEntry.stage = "Issued";
-
-          // Set Dependencies in ROB Entry
-          robEntry.vj = rs1.val;
-          robEntry.qj = rs1.rob;
-          robEntry.vk = rs2.val;
-          robEntry.qk = rs2.rob;
-
-          next.robTail = (next.robTail + 1) % config.robSize;
-
-          // PREDICT NOT TAKEN: Just go next
-          next.pc++;
-          addToLog(
-            `Issued ${inst.op} to ROB#${robEntry.entry} (Predict Not Taken)`
-          );
-        } else {
-          let type = "";
-          if (LOAD_OPS.includes(inst.op)) type = "LOAD";
-          else if (["MUL.D", "DIV.D", "MUL.S", "DIV.S"].includes(inst.op))
-            type = "MULT";
-          else type = "ADD";
-
-          const freeRSIndex = next.rs[type].findIndex((u) => !u.busy);
-
-          if (freeRSIndex !== -1) {
-            const rsUnit = next.rs[type][freeRSIndex];
-            const robIndex = next.robTail;
-            const robEntry = next.rob[robIndex];
-            const robId = robEntry.entry;
-
-            robEntry.busy = true;
-            robEntry.instr = inst.text;
-            robEntry.dest = inst.dest;
-            robEntry.type = inst.op;
-            robEntry.stage = "Issued";
-            robEntry.valQ = null;
-            next.robTail = (next.robTail + 1) % config.robSize;
-
-            rsUnit.busy = true;
-            rsUnit.op = inst.op;
-            rsUnit.dest = robId;
-            rsUnit.timer = config.latencies[inst.op] || 1;
-            rsUnit.state = "IDLE";
-
-            const getRegVal = (regName) => {
-              if (!isNaN(regName))
-                return { val: parseFloat(regName), rob: null };
-              const r = next.regs[regName];
-              if (!r) return { val: 0, rob: null };
-              if (r.rob !== null) {
-                const robDep = next.rob.find((rb) => rb.entry === r.rob);
-                if (
-                  robDep &&
-                  (robDep.stage === "Write" || robDep.stage === "Commit")
-                )
-                  return { val: robDep.value, rob: null };
-                return { val: null, rob: r.rob };
-              }
-              return { val: r.val, rob: null };
-            };
-
-            if (type === "LOAD") {
-              const base = getRegVal(inst.rs);
-              rsUnit.vj = base.val;
-              rsUnit.qj = base.rob;
-              rsUnit.vk = inst.imm;
-              if (inst.dest) next.regs[inst.dest].rob = robId;
-            } else {
-              const src1 = getRegVal(inst.src1);
-              const src2 = getRegVal(inst.src2);
-              rsUnit.vj = src1.val;
-              rsUnit.qj = src1.rob;
+            // Check if 2 operand branch (BNE) or 1 (BNEZ)
+            if (inst.rt) {
+              const src2 = getReg(inst.rt);
               rsUnit.vk = src2.val;
-              rsUnit.qk = src2.rob;
-              if (inst.dest) next.regs[inst.dest].rob = robId;
+              rsUnit.qk = src2.qi;
+            } else {
+              rsUnit.vk = 0;
+              rsUnit.qk = null; // Compare vs 0
             }
 
-            next.pc++;
-            addToLog(`Issued ${inst.text} to RS:${rsUnit.id} ROB:#${robId}`);
+            rsUnit.address = inst.target; // Store Target Label
+            next.branchStall = true; // Stall Fetch
           } else {
-            addToLog(`Stall: No RS for ${inst.op}`);
+            const src1 = getReg(inst.src1);
+            const src2 = getReg(inst.src2);
+            rsUnit.vj = src1.val;
+            rsUnit.qj = src1.qi;
+            rsUnit.vk = src2.val;
+            rsUnit.qk = src2.qi;
+            if (inst.dest) next.regs[inst.dest].qi = rsUnit.id;
           }
+
+          next.pc++;
+          addToLog(`Issued ${inst.text} to ${rsUnit.id}`);
+        } else {
+          addToLog(`Stall: No RS for ${inst.op}`);
         }
       }
     }
 
-    next.flushed = false;
     next.log = [...log, ...next.log].slice(0, 50);
     return next;
   }
   return state;
 };
 
-// --- COMPONENTS ---
+// --- UI COMPONENTS ---
+
+const Section = ({ title, children, icon: Icon, className = "" }) => (
+  <div
+    className={`bg-gray-800 rounded-xl overflow-hidden shadow-lg border border-gray-700 flex flex-col ${className}`}
+  >
+    <div className="bg-gray-700/50 px-3 py-2 border-b border-gray-700 flex items-center gap-2">
+      {Icon && <Icon size={14} className="text-blue-400" />}
+      <h3 className="font-semibold text-gray-200 text-xs tracking-wider uppercase">
+        {title}
+      </h3>
+    </div>
+    <div className="p-2 overflow-auto flex-1 custom-scrollbar">{children}</div>
+  </div>
+);
+
+const RSTable = ({ stations, type }) => (
+  <table className="w-full text-xs text-left border-collapse">
+    <thead className="bg-gray-900/50 text-gray-500">
+      <tr>
+        <th className="p-1">ID</th>
+        <th className="p-1">Busy</th>
+        <th className="p-1">Op</th>
+        <th className="p-1">Vj</th>
+        <th className="p-1">Vk</th>
+        <th className="p-1">Qj</th>
+        <th className="p-1">Qk</th>
+        {type === "LOAD" || type === "STORE" ? (
+          <th className="p-1">Addr</th>
+        ) : null}
+        <th className="p-1">Time</th>
+      </tr>
+    </thead>
+    <tbody className="divide-y divide-gray-800">
+      {stations.map((u) => (
+        <tr key={u.id} className={u.busy ? "bg-gray-800/80" : "opacity-30"}>
+          <td className="p-1 font-medium text-blue-300">{u.id}</td>
+          <td className="p-1 text-gray-400">{u.busy ? "Yes" : "No"}</td>
+          <td className="p-1 text-white">{u.busy ? u.op : ""}</td>
+          <td className="p-1 font-mono text-gray-400">
+            {u.busy && u.vj !== null ? u.vj : ""}
+          </td>
+          <td className="p-1 font-mono text-gray-400">
+            {u.busy && u.vk !== null ? u.vk : ""}
+          </td>
+          <td className="p-1 text-yellow-500">{u.busy ? u.qj : ""}</td>
+          <td className="p-1 text-yellow-500">{u.busy ? u.qk : ""}</td>
+          {type === "LOAD" || type === "STORE" ? (
+            <td className="p-1 text-orange-300">
+              {u.busy
+                ? typeof u.address === "number"
+                  ? u.address
+                  : u.busy
+                  ? "Calc"
+                  : ""
+                : ""}
+            </td>
+          ) : null}
+          <td className="p-1 font-bold text-green-400">
+            {u.busy && u.timer > 0 ? u.timer : ""}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+);
+
+const RegisterFile = ({ regs }) => (
+  <div className="grid grid-cols-4 gap-1">
+    {Object.keys(regs).map((k) => (
+      <div
+        key={k}
+        className={`p-1 rounded text-[10px] border ${
+          regs[k].qi
+            ? "border-yellow-600 bg-yellow-900/20"
+            : "border-gray-700 bg-gray-800"
+        }`}
+      >
+        <div className="flex justify-between">
+          <span className="font-bold text-gray-400">{k}</span>
+          {regs[k].qi && <span className="text-yellow-400">{regs[k].qi}</span>}
+        </div>
+        <div className="truncate text-gray-200">{regs[k].val}</div>
+      </div>
+    ))}
+  </div>
+);
 
 const ConfigScreen = ({ onStart }) => {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
-
   const updateVal = (path, val) => {
     const keys = path.split(".");
     setConfig((prev) => {
@@ -670,292 +547,92 @@ const ConfigScreen = ({ onStart }) => {
       return next;
     });
   };
-
-  const updateCombinedLatency = (val) => {
-    const intVal = parseInt(val);
-    setConfig((prev) => {
-      const next = JSON.parse(JSON.stringify(prev));
-      [
-        "ADD.D",
-        "ADD.S",
-        "SUB.D",
-        "SUB.S",
-        "ADDI",
-        "SUBI",
-        "DADDI",
-        "DSUBI",
-      ].forEach((k) => (next.latencies[k] = intVal));
-      return next;
-    });
-  };
-
-  const updateLatency = (ops, val) => {
-    const intVal = parseInt(val);
-    setConfig((prev) => {
-      const next = JSON.parse(JSON.stringify(prev));
-      ops.forEach((k) => (next.latencies[k] = intVal));
-      return next;
-    });
-  };
-
   return (
-    <div className="p-6 max-w-4xl mx-auto bg-gray-900 text-gray-100 rounded-xl shadow-2xl">
-      <div className="flex items-center gap-3 mb-6 border-b border-gray-700 pb-4">
-        <Settings className="text-blue-400" />
-        <h1 className="text-2xl font-bold">System Configuration</h1>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-        <div className="space-y-4">
-          <h3 className="font-bold text-blue-300 uppercase tracking-wider text-sm">
-            Structure Sizes
+    <div className="p-8 max-w-2xl mx-auto bg-gray-900 text-gray-100 rounded-xl mt-10 shadow-2xl">
+      <h1 className="text-2xl font-bold mb-6 text-blue-400">
+        Classic Tomasulo Config
+      </h1>
+      <div className="space-y-6">
+        <div>
+          <h3 className="font-bold text-gray-400 mb-2 uppercase text-xs">
+            Buffer Sizes
           </h3>
-          <div className="grid grid-cols-2 gap-4">
-            <label className="text-sm">
-              ROB Entries
-              <input
-                type="number"
-                value={config.robSize}
-                onChange={(e) => updateVal("robSize", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-            <label className="text-sm">
-              Load Buffers
-              <input
-                type="number"
-                value={config.rsSize.LOAD}
-                onChange={(e) => updateVal("rsSize.LOAD", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-            <label className="text-sm">
-              Add/Sub RS
-              <input
-                type="number"
-                value={config.rsSize.ADD}
-                onChange={(e) => updateVal("rsSize.ADD", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-            <label className="text-sm">
-              Mult/Div RS
-              <input
-                type="number"
-                value={config.rsSize.MULT}
-                onChange={(e) => updateVal("rsSize.MULT", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
+          <div className="grid grid-cols-4 gap-4">
+            {["ADD", "MULT", "LOAD", "STORE"].map((t) => (
+              <label key={t} className="text-xs">
+                {t} Stations
+                <input
+                  type="number"
+                  value={config.rsSize[t]}
+                  onChange={(e) => updateVal(`rsSize.${t}`, e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded p-1 mt-1"
+                />
+              </label>
+            ))}
           </div>
         </div>
-
-        <div className="space-y-4">
-          <h3 className="font-bold text-yellow-300 uppercase tracking-wider text-sm">
-            Instruction Latencies
+        <div>
+          <h3 className="font-bold text-gray-400 mb-2 uppercase text-xs">
+            Latencies
           </h3>
-          <div className="grid grid-cols-2 gap-4">
-            <label className="text-sm col-span-2">
-              Add/Sub (FP & Int)
+          <div className="grid grid-cols-4 gap-4">
+            <label className="text-xs">
+              Add/Sub
               <input
                 type="number"
                 defaultValue={2}
-                onChange={(e) => updateCombinedLatency(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
+                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
+                onChange={(e) => {
+                  const v = parseInt(e.target.value);
+                  setConfig((p) => {
+                    const n = { ...p };
+                    ["ADD.D", "SUB.D", "ADDI"].forEach(
+                      (k) => (n.latencies[k] = v)
+                    );
+                    return n;
+                  });
+                }}
               />
             </label>
-            <label className="text-sm">
-              Multiplication
+            <label className="text-xs">
+              Mult
               <input
                 type="number"
                 value={config.latencies["MUL.D"]}
-                onChange={(e) =>
-                  updateLatency(["MUL.D", "MUL.S"], e.target.value)
-                }
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
+                onChange={(e) => updateVal(`latencies.MUL.D`, e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
               />
             </label>
-            <label className="text-sm">
-              Division
+            <label className="text-xs">
+              Div
               <input
                 type="number"
                 value={config.latencies["DIV.D"]}
-                onChange={(e) =>
-                  updateLatency(["DIV.D", "DIV.S"], e.target.value)
-                }
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
+                onChange={(e) => updateVal(`latencies.DIV.D`, e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
               />
             </label>
-            <label className="text-sm">
-              Load / Store
+            <label className="text-xs">
+              Load/Store
               <input
                 type="number"
                 value={config.latencies["L.D"]}
-                onChange={(e) =>
-                  updateLatency(
-                    ["L.D", "L.S", "LW", "LD", "S.D", "S.S", "SW", "SD"],
-                    e.target.value
-                  )
-                }
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-          </div>
-        </div>
-
-        <div className="space-y-4 col-span-1 md:col-span-2">
-          <h3 className="font-bold text-green-300 uppercase tracking-wider text-sm">
-            Memory & Cache
-          </h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <label className="text-sm">
-              Total Size (Bytes)
-              <input
-                type="number"
-                value={config.cache.size}
-                onChange={(e) => updateVal("cache.size", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-            <label className="text-sm">
-              Block Size
-              <input
-                type="number"
-                value={config.cache.blockSize}
-                onChange={(e) => updateVal("cache.blockSize", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-            <label className="text-sm">
-              Hit Latency
-              <input
-                type="number"
-                value={config.cache.hitLatency}
-                onChange={(e) => updateVal("cache.hitLatency", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
-              />
-            </label>
-            <label className="text-sm">
-              Miss Penalty
-              <input
-                type="number"
-                value={config.cache.missPenalty}
-                onChange={(e) => updateVal("cache.missPenalty", e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-2 mt-1"
+                onChange={(e) => updateVal(`latencies.L.D`, e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
               />
             </label>
           </div>
         </div>
       </div>
-
       <button
         onClick={() => onStart(config)}
-        className="mt-8 w-full py-3 bg-blue-600 hover:bg-blue-500 rounded font-bold text-white transition-colors"
+        className="mt-8 w-full py-3 bg-blue-600 hover:bg-blue-500 rounded font-bold"
       >
-        Initialize Simulation
+        Initialize
       </button>
     </div>
   );
 };
-
-const RegisterGrid = ({ regs, filter }) => (
-  <div className="grid grid-cols-4 md:grid-cols-8 gap-1">
-    {Object.keys(regs)
-      .filter((k) => k.startsWith(filter))
-      .map((key) => {
-        const r = regs[key];
-        return (
-          <div
-            key={key}
-            className={`p-1 rounded text-[10px] border ${
-              r.rob
-                ? "border-yellow-600 bg-yellow-900/20"
-                : "border-gray-700 bg-gray-800"
-            }`}
-          >
-            <div className="flex justify-between">
-              <span className="font-bold text-gray-400">{key}</span>
-              {r.rob && <span className="text-yellow-400">#{r.rob}</span>}
-            </div>
-            <div className="truncate text-gray-200">
-              {typeof r.val === "number" ? r.val.toFixed(1) : r.val}
-            </div>
-          </div>
-        );
-      })}
-  </div>
-);
-
-const MemoryView = ({ memoryValues, size }) => {
-  const rows = Math.ceil(size / 8);
-  return (
-    <div className="h-full overflow-y-auto font-mono text-xs">
-      {Array.from({ length: rows }).map((_, rIdx) => (
-        <div
-          key={rIdx}
-          className="flex border-b border-gray-800 hover:bg-gray-800"
-        >
-          <div className="w-12 text-gray-500 py-1 bg-gray-900 px-2">
-            {rIdx * 8}
-          </div>
-          <div className="flex-1 flex">
-            {Array.from({ length: 8 }).map((_, bIdx) => {
-              const addr = rIdx * 8 + bIdx;
-              const val = memoryValues[addr];
-              return (
-                <div
-                  key={addr}
-                  className={`flex-1 flex justify-center py-1 border-r border-gray-800 ${
-                    val
-                      ? "bg-blue-900/30 text-blue-300 font-bold"
-                      : "text-gray-600"
-                  }`}
-                >
-                  {val ? val : "00"}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-};
-
-const CacheView = ({ blocks, blockSize }) => (
-  <div className="h-full overflow-y-auto text-xs">
-    <table className="w-full text-left">
-      <thead className="bg-gray-800 text-gray-400">
-        <tr>
-          <th className="p-1">Blk</th>
-          <th className="p-1">V</th>
-          <th className="p-1">Tag</th>
-          <th className="p-1">Data</th>
-        </tr>
-      </thead>
-      <tbody>
-        {blocks.map((b, i) => (
-          <tr key={i} className="border-b border-gray-800">
-            <td className="p-1 text-gray-500">{i}</td>
-            <td className="p-1">
-              {b.valid ? (
-                <span className="text-green-500">1</span>
-              ) : (
-                <span className="text-red-500">0</span>
-              )}
-            </td>
-            <td className="p-1 font-mono text-yellow-500">
-              {b.tag !== null ? b.tag : "-"}
-            </td>
-            <td className="p-1 text-gray-400">
-              {b.valid ? "Active" : "Empty"}
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  </div>
-);
 
 export default function TomasuloSimulator() {
   const [config, setConfig] = useState(null);
@@ -963,318 +640,151 @@ export default function TomasuloSimulator() {
   const [state, dispatch] = useReducer(reducer, null);
   const [activeTab, setActiveTab] = useState("FP");
 
-  const startSim = (cfg) => {
-    setConfig(cfg);
-    dispatch({ type: "RESET", config: cfg, code });
-  };
-
-  if (!config || !state) return <ConfigScreen onStart={startSim} />;
+  if (!config || !state)
+    return (
+      <ConfigScreen
+        onStart={(c) => {
+          setConfig(c);
+          dispatch({ type: "RESET", config: c, code });
+        }}
+      />
+    );
 
   return (
-    <div className="h-screen bg-gray-950 text-gray-100 flex flex-col font-sans overflow-hidden">
-      {/* TOOLBAR */}
-      <div className="bg-gray-900 border-b border-gray-800 p-2 flex justify-between items-center shrink-0">
+    <div className="h-screen bg-gray-950 text-gray-100 flex flex-col font-sans text-xs">
+      {/* HEADER */}
+      <div className="bg-gray-900 border-b border-gray-800 p-2 flex justify-between items-center">
         <div className="flex items-center gap-4">
-          <h1 className="font-bold text-lg bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent ml-2">
-            Tomasulo Sim
+          <h1 className="font-bold text-lg text-blue-400 ml-2">
+            Classic Tomasulo
           </h1>
-          <div className="h-6 w-px bg-gray-700"></div>
           <div className="flex gap-2">
             <button
               onClick={() => dispatch({ type: "STEP" })}
-              className="flex items-center gap-2 bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded text-sm font-medium"
+              className="bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded font-bold flex items-center gap-2"
             >
               <SkipForward size={14} /> Step
             </button>
             <button
-              onClick={() => setConfig(null)}
-              className="flex items-center gap-2 bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded text-sm"
-            >
-              <Settings size={14} /> Config
-            </button>
-            <button
               onClick={() => dispatch({ type: "RESET", config, code })}
-              className="flex items-center gap-2 bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded text-sm"
+              className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded flex items-center gap-2"
             >
               <RotateCcw size={14} /> Reset
             </button>
+            <button
+              onClick={() => setConfig(null)}
+              className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded flex items-center gap-2"
+            >
+              <Settings size={14} /> Config
+            </button>
           </div>
         </div>
-        <div className="flex items-center gap-4 mr-4">
-          <span className="text-gray-400 text-xs uppercase">Clock</span>
-          <span className="text-2xl font-mono font-bold text-white">
-            {state.clock}
-          </span>
+        <div className="mr-4 text-xl font-mono font-bold">
+          Cycle: {state.clock}
         </div>
       </div>
 
-      {/* MAIN CONTENT */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* LEFT COLUMN: Code & Queue & Log */}
-        <div className="w-80 flex flex-col border-r border-gray-800 bg-gray-900/50">
-          <div className="h-1/3 p-2 flex flex-col border-b border-gray-800">
-            <div className="flex justify-between mb-1 text-xs font-bold text-gray-500 uppercase">
-              <span>Instruction Queue</span>
-              <span>PC: {state.pc}</span>
+      {/* BODY */}
+      <div className="flex-1 flex overflow-hidden p-2 gap-2">
+        {/* COL 1: Code & Regs */}
+        <div className="flex flex-col gap-2 w-1/4 min-w-[250px]">
+          <Section title="Instruction Queue" icon={Layers} className="flex-[2]">
+            {state.instructions.map((inst, i) => (
+              <div
+                key={i}
+                className={`flex px-1 ${
+                  i === state.pc
+                    ? "bg-blue-900/50 text-white border border-blue-500"
+                    : "text-gray-500"
+                }`}
+              >
+                <span className="w-6">{i}</span>
+                <span>{inst.text}</span>
+                {i === state.pc && (
+                  <span className="ml-auto text-blue-300 font-bold">
+                    <GitBranch size={10} />
+                  </span>
+                )}
+              </div>
+            ))}
+          </Section>
+          <Section title="Register File" icon={Database} className="flex-[3]">
+            <div className="flex gap-2 mb-2">
+              <button
+                onClick={() => setActiveTab("FP")}
+                className={`px-2 py-1 rounded ${
+                  activeTab === "FP" ? "bg-blue-600" : "bg-gray-800"
+                }`}
+              >
+                FP
+              </button>
+              <button
+                onClick={() => setActiveTab("R")}
+                className={`px-2 py-1 rounded ${
+                  activeTab === "R" ? "bg-blue-600" : "bg-gray-800"
+                }`}
+              >
+                INT
+              </button>
             </div>
-            <div className="flex-1 overflow-auto bg-gray-950 rounded border border-gray-800 font-mono text-xs p-2">
-              {state.instructions.map((inst, i) => (
+            <RegisterFile
+              regs={Object.fromEntries(
+                Object.entries(state.regs).filter(([k]) =>
+                  k.startsWith(activeTab === "FP" ? "F" : "R")
+                )
+              )}
+            />
+          </Section>
+        </div>
+
+        {/* COL 2: Reservation Stations */}
+        <div className="flex flex-col gap-2 w-2/4 min-w-[400px]">
+          <Section
+            title="Adder RS (Add/Sub/Branch)"
+            icon={Cpu}
+            className="flex-1"
+          >
+            <RSTable stations={state.rs.ADD} type="ADD" />
+          </Section>
+          <Section
+            title="Multiplier RS (Mult/Div)"
+            icon={Cpu}
+            className="flex-1"
+          >
+            <RSTable stations={state.rs.MULT} type="MULT" />
+          </Section>
+          <Section title="Load Buffers" icon={MemoryStick} className="flex-1">
+            <RSTable stations={state.rs.LOAD} type="LOAD" />
+          </Section>
+          <Section title="Store Buffers" icon={Archive} className="flex-1">
+            <RSTable stations={state.rs.STORE} type="STORE" />
+          </Section>
+        </div>
+
+        {/* COL 3: Memory & Log */}
+        <div className="flex flex-col gap-2 w-1/4 min-w-[200px]">
+          <Section title="Memory" icon={Database} className="flex-1">
+            <div className="font-mono space-y-1">
+              {Object.entries(state.memoryValues).map(([addr, val]) => (
                 <div
-                  key={i}
-                  className={`${
-                    i === state.pc
-                      ? "bg-blue-900/50 text-white ring-1 ring-blue-500"
-                      : i < state.pc
-                      ? "text-gray-600"
-                      : "text-gray-400"
-                  } px-1 rounded`}
+                  key={addr}
+                  className="flex justify-between border-b border-gray-800"
                 >
-                  {inst.type === "LABEL" ? (
-                    <span className="text-yellow-500 font-bold">
-                      {inst.label}:
-                    </span>
-                  ) : (
-                    <span className="ml-4">{inst.text}</span>
-                  )}
+                  <span className="text-gray-500">M[{addr}]</span>
+                  <span className="text-blue-300">{val}</span>
                 </div>
               ))}
             </div>
-          </div>
-
-          <div className="h-1/3 border-b border-gray-800 flex flex-col">
-            <div className="bg-gray-800 px-2 py-1 text-xs font-bold text-gray-400 flex items-center gap-2">
-              <AlertCircle size={12} /> Event Log
-            </div>
-            <div className="flex-1 overflow-auto p-2 font-mono text-[10px] space-y-1">
+          </Section>
+          <Section title="Log" icon={AlertCircle} className="flex-[2]">
+            <div className="font-mono text-[10px] space-y-1">
               {state.log.map((l, i) => (
-                <div
-                  key={i}
-                  className="text-gray-400 border-l-2 border-gray-700 pl-1"
-                >
+                <div key={i} className="border-l-2 border-gray-700 pl-1">
                   {l}
                 </div>
               ))}
             </div>
-          </div>
-
-          <div className="flex-1 flex flex-col">
-            <div className="bg-gray-800 px-2 py-1 text-xs font-bold text-gray-400 flex items-center gap-2">
-              <Edit3 size={12} /> Editor
-            </div>
-            <textarea
-              className="flex-1 bg-gray-950 p-2 font-mono text-xs text-gray-300 resize-none focus:outline-none"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-            />
-          </div>
-        </div>
-
-        {/* MIDDLE COLUMN: Execution Units & RS */}
-        <div className="flex-1 flex flex-col min-w-0 bg-gray-950 overflow-y-auto">
-          {/* REGISTER FILE */}
-          <div className="p-2 border-b border-gray-800">
-            <div className="flex gap-4 mb-2">
-              <button
-                onClick={() => setActiveTab("FP")}
-                className={`text-xs font-bold px-2 py-1 rounded ${
-                  activeTab === "FP"
-                    ? "bg-blue-600 text-white"
-                    : "bg-gray-800 text-gray-400"
-                }`}
-              >
-                Floating Point (F0-F31)
-              </button>
-              <button
-                onClick={() => setActiveTab("R")}
-                className={`text-xs font-bold px-2 py-1 rounded ${
-                  activeTab === "R"
-                    ? "bg-blue-600 text-white"
-                    : "bg-gray-800 text-gray-400"
-                }`}
-              >
-                Integer (R0-R31)
-              </button>
-            </div>
-            <RegisterGrid
-              regs={state.regs}
-              filter={activeTab === "FP" ? "F" : "R"}
-            />
-          </div>
-
-          {/* RESERVATION STATIONS */}
-          <div className="p-2 space-y-4">
-            {Object.entries(state.rs).map(([type, units]) => (
-              <div
-                key={type}
-                className="border border-gray-800 rounded overflow-hidden"
-              >
-                <div className="bg-gray-900 px-3 py-1 text-xs font-bold text-gray-400 uppercase flex justify-between">
-                  <span className="flex items-center gap-2">
-                    <Cpu size={12} /> {type} Station
-                  </span>
-                  <span className="text-gray-600">Size: {units.length}</span>
-                </div>
-                <table className="w-full text-xs text-left">
-                  <thead className="bg-gray-800/50 text-gray-500">
-                    <tr>
-                      <th className="p-1">ID</th>
-                      <th className="p-1">Busy</th>
-                      <th className="p-1">Op</th>
-                      <th className="p-1">Vj</th>
-                      <th className="p-1">Vk</th>
-                      <th className="p-1">Qj</th>
-                      <th className="p-1">Qk</th>
-                      <th className="p-1">Dest (ROB)</th>
-                      <th className="p-1">Timer</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-800">
-                    {units.map((u) => (
-                      <tr key={u.id} className={u.busy ? "bg-gray-900" : ""}>
-                        <td className="p-1 font-medium text-blue-300">
-                          {u.id}
-                        </td>
-                        <td className="p-1">{u.busy ? "Yes" : "No"}</td>
-                        <td className="p-1">{u.op}</td>
-                        <td className="p-1 font-mono text-gray-400">
-                          {u.vj !== null
-                            ? typeof u.vj === "number"
-                              ? u.vj.toFixed(0)
-                              : u.vj
-                            : ""}
-                        </td>
-                        <td className="p-1 font-mono text-gray-400">
-                          {u.vk !== null
-                            ? typeof u.vk === "number"
-                              ? u.vk.toFixed(0)
-                              : u.vk
-                            : ""}
-                        </td>
-                        <td className="p-1 text-yellow-500">
-                          {u.qj ? `#${u.qj}` : ""}
-                        </td>
-                        <td className="p-1 text-yellow-500">
-                          {u.qk ? `#${u.qk}` : ""}
-                        </td>
-                        <td className="p-1 text-green-500">
-                          {u.busy ? `#${u.dest}` : ""}
-                        </td>
-                        <td className="p-1 font-bold text-white">
-                          {u.timer > 0 ? u.timer : ""}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* RIGHT COLUMN: ROB, Memory, Cache */}
-        <div className="w-96 flex flex-col border-l border-gray-800 bg-gray-900/30">
-          {/* ROB */}
-          <div className="flex-[2] border-b border-gray-800 flex flex-col min-h-0">
-            <div className="bg-gray-800 px-2 py-1 text-xs font-bold text-gray-400 flex items-center gap-2">
-              <Layers size={12} /> Re-Order Buffer (ROB)
-            </div>
-            <div className="flex-1 overflow-auto">
-              <table className="w-full text-xs text-left">
-                <thead className="bg-gray-800/50 sticky top-0 text-gray-400">
-                  <tr>
-                    <th className="p-1">#</th>
-                    <th className="p-1">Type</th>
-                    <th className="p-1">Dest</th>
-                    <th className="p-1">Value</th>
-                    <th className="p-1">Ready</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-800">
-                  {state.rob.map((r, i) => {
-                    const isHead = i === state.robHead;
-                    let destDisplay = "-";
-                    if (STORE_OPS.includes(r.type)) {
-                      destDisplay =
-                        r.stage === "Write" || r.stage === "Commit"
-                          ? `Mem[${r.address}]`
-                          : "Addr?";
-                    } else if (BRANCH_OPS.includes(r.type)) {
-                      destDisplay = "-";
-                    } else {
-                      destDisplay = r.dest || "-";
-                    }
-
-                    // Determine Style for Ready Col
-                    let readyColor = "text-gray-500";
-                    if (r.stage === "Issued") readyColor = "text-yellow-500";
-                    if (r.stage === "Exec") readyColor = "text-blue-400";
-                    if (r.stage === "Write") readyColor = "text-green-400";
-                    if (r.stage === "Commit")
-                      readyColor = "text-purple-400 font-bold";
-
-                    return (
-                      <tr
-                        key={r.entry}
-                        className={`${r.busy ? "bg-gray-800/50" : ""} ${
-                          isHead
-                            ? "border-l-2 border-green-500 bg-green-900/10"
-                            : ""
-                        }`}
-                      >
-                        <td className="p-1 font-mono text-yellow-500">
-                          #{r.entry}
-                        </td>
-                        <td className="p-1 text-gray-400">{r.type}</td>
-                        <td className="p-1 text-blue-300">{destDisplay}</td>
-                        <td className="p-1 font-mono">
-                          {STORE_OPS.includes(r.type) ? (
-                            r.valQ ? (
-                              <span className="text-yellow-500">
-                                Wait #{r.valQ}
-                              </span>
-                            ) : r.value !== null ? (
-                              r.value
-                            ) : (
-                              "-"
-                            )
-                          ) : r.value !== null ? (
-                            r.value
-                          ) : (
-                            "-"
-                          )}
-                        </td>
-                        <td className={`p-1 ${readyColor}`}>
-                          {r.stage === "Empty" ? "" : r.stage}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* CACHE & MEMORY */}
-          <div className="flex-1 flex flex-row min-h-0">
-            <div className="flex-1 flex flex-col border-r border-gray-800">
-              <div className="bg-gray-800 px-2 py-1 text-xs font-bold text-gray-400 flex items-center gap-2">
-                <MemoryStick size={12} /> Cache ({config.cache.size}B)
-              </div>
-              <CacheView
-                blocks={state.cache}
-                blockSize={config.cache.blockSize}
-              />
-            </div>
-            <div className="flex-1 flex flex-col">
-              <div className="bg-gray-800 px-2 py-1 text-xs font-bold text-gray-400 flex items-center gap-2">
-                <Database size={12} /> Memory
-              </div>
-              <MemoryView
-                memoryValues={state.memoryValues}
-                size={config.memorySize}
-              />
-            </div>
-          </div>
+          </Section>
         </div>
       </div>
     </div>
