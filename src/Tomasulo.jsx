@@ -1,4 +1,4 @@
-import React, { useState, useReducer } from "react";
+import React, { useState, useReducer, useEffect } from "react";
 import {
   SkipForward,
   RotateCcw,
@@ -12,9 +12,16 @@ import {
   Play,
   Settings,
   Code,
+  Plus,
+  Trash2,
+  FileText,
+  AlertTriangle,
+  X,
 } from "lucide-react";
 
-// --- CONSTANTS & CONFIG ---
+// ==========================================
+// 1. CONSTANTS
+// ==========================================
 
 const DEFAULT_CONFIG = {
   rsSize: { ADD: 3, MULT: 2, LOAD: 3, STORE: 3 },
@@ -48,22 +55,53 @@ const DEFAULT_CONFIG = {
   },
   cache: {
     enabled: true,
-    size: 64, // Total bytes
-    blockSize: 8, // Bytes per block
+    size: 64,
+    blockSize: 8,
     hitLatency: 1,
     missPenalty: 10,
   },
-  memorySize: 256, // Total Memory Size in Bytes
+  memorySize: 256,
 };
 
-const DEFAULT_CODE = `S.D F6, 0(R2)
-DADDIU R1, R1, 8
-DADDIU R2, R2, 8
-DSLTU R3, R1, R4
-BNEZ R3, foo
-foo:`;
+const DEFAULT_CODE = `MUL R3, R1, R2
+ADD R5, R3, R4
+ADD R7, R2, R6
+ADD R10, R8, R9
+MUL R11, R7, R10
+ADD R5, R5, R11`;
 
-// --- UTILS ---
+const OPCODES = [
+  "L.D",
+  "L.S",
+  "LW",
+  "LD",
+  "S.D",
+  "S.S",
+  "SW",
+  "SD",
+  "ADD.D",
+  "ADD.S",
+  "SUB.D",
+  "SUB.S",
+  "MUL.D",
+  "MUL.S",
+  "DIV.D",
+  "DIV.S",
+  "ADDI",
+  "SUBI",
+  "DADDI",
+  "DSUBI",
+  "DADDIU",
+  "DSLTU",
+  "BNE",
+  "BEQ",
+  "BNEZ",
+  "BEQZ",
+];
+
+// ==========================================
+// 2. UTILITIES
+// ==========================================
 
 const parseInstruction = (line) => {
   const cleanLine = line.trim().replace(/,/g, " ").replace(/\s+/g, " ");
@@ -87,21 +125,17 @@ const parseInstruction = (line) => {
   if (["L.D", "L.S", "LW", "LD"].includes(op)) type = "LOAD";
   else if (["S.D", "S.S", "SW", "SD"].includes(op)) type = "STORE";
   else if (["BNE", "BEQ", "BNEZ", "BEQZ"].includes(op)) type = "BRANCH";
+  else if (["MUL.D", "MUL.S", "DIV.D", "DIV.S"].includes(op)) type = "MULT";
+  else type = "ADD";
 
-  return {
-    text: instruction,
-    label,
-    op,
-    tokens: tokens.slice(1),
-    type,
-  };
+  return { text: instruction, label, op, tokens: tokens.slice(1), type };
 };
 
-const toBinary32 = (num) => {
-  return (num >>> 0).toString(2).padStart(32, "0");
-};
+const toBinary32 = (num) => (num >>> 0).toString(2).padStart(32, "0");
 
-// --- SIMULATOR LOGIC ---
+// ==========================================
+// 3. SIMULATION LOGIC (REDUCER)
+// ==========================================
 
 const generateInitialState = (config, codeText) => {
   const lines = codeText.split("\n");
@@ -120,16 +154,12 @@ const generateInitialState = (config, codeText) => {
     }
   });
 
-  // Second pass: Resolve Branch Targets
+  // Resolve Labels
   instructions.forEach((inst) => {
     if (inst.type === "BRANCH") {
-      let labelTokenIdx = -1;
-      let labelName = null;
-      if (["BNEZ", "BEQZ"].includes(inst.op)) labelTokenIdx = 1;
-      else labelTokenIdx = 2;
-
+      let labelTokenIdx = ["BNEZ", "BEQZ"].includes(inst.op) ? 1 : 2;
       if (inst.tokens[labelTokenIdx]) {
-        labelName = inst.tokens[labelTokenIdx];
+        const labelName = inst.tokens[labelTokenIdx];
         if (labels[labelName] !== undefined) {
           inst.tokens[labelTokenIdx] = labels[labelName].toString();
           inst.text = `${inst.op} ${inst.tokens.join(", ")}`;
@@ -142,16 +172,17 @@ const generateInitialState = (config, codeText) => {
   for (let i = 0; i < 32; i++) regs[`R${i}`] = { val: 0, qi: null };
   for (let i = 0; i < 32; i++) regs[`F${i}`] = { val: 0.0, qi: null };
 
-  // Default values
-  regs["R1"].val = 0;
+  // Default Vals for Loop
+  regs["R1"].val = 32;
   regs["R2"].val = 0;
-  regs["R4"].val = 32;
-  regs["F6"].val = 99.0;
+  regs["F2"].val = 0.5;
 
   const memory = {};
-  for (let i = 0; i < config.memorySize; i += 4) {
-    memory[i] = 0;
-  }
+  for (let i = 0; i < config.memorySize; i += 4) memory[i] = 0;
+  memory[32] = 100;
+  memory[24] = 200;
+  memory[16] = 300;
+  memory[8] = 400;
 
   const rs = {};
   Object.keys(config.rsSize).forEach((type) => {
@@ -195,11 +226,13 @@ const generateInitialState = (config, codeText) => {
     iteration: 1,
     branchStall: false,
     stalledPc: null,
+    modalMsg: null,
   };
 };
 
 const reducer = (state, action) => {
   if (action.type === "EXIT") return null;
+  if (action.type === "CLOSE_MODAL") return { ...state, modalMsg: null };
   if (action.type === "RESET")
     return generateInitialState(action.config, action.code);
 
@@ -207,230 +240,266 @@ const reducer = (state, action) => {
     let next = JSON.parse(JSON.stringify(state));
     next.clock++;
     next.stalledPc = null;
+    next.modalMsg = null;
 
-    // --- PHASE 1: WRITE RESULT (CDB Arbitration) ---
+    // 1. WRITE RESULT (Arbitration)
     const writeCandidates = [];
-
     Object.values(next.rs)
       .flat()
       .forEach((u) => {
         if (u.state === "WRITE_READY") {
           if (u.type === "STORE") {
             if (u.qk === null) writeCandidates.push(u);
-          } else {
-            writeCandidates.push(u);
-          }
+          } else writeCandidates.push(u);
         }
       });
 
     if (writeCandidates.length > 0) {
-      // Priority Sort
+      // Priority Logic
       writeCandidates.sort((a, b) => {
-        // 1. Dependent Count
         let depA = 0,
           depB = 0;
         Object.values(next.rs)
           .flat()
-          .forEach((other) => {
-            if (other.busy && (other.qj === a.id || other.qk === a.id)) depA++;
-            if (other.busy && (other.qj === b.id || other.qk === b.id)) depB++;
+          .forEach((o) => {
+            if (o.busy && (o.qj === a.id || o.qk === a.id)) depA++;
+            if (o.busy && (o.qj === b.id || o.qk === b.id)) depB++;
           });
         if (depA !== depB) return depB - depA;
 
-        // 2. Ready-to-Exec Count
+        // Count how many would become ready
         let readyA = 0,
           readyB = 0;
         Object.values(next.rs)
           .flat()
-          .forEach((other) => {
-            if (other.busy) {
-              if (other.qj === a.id && other.qk === null) readyA++;
-              else if (other.qk === a.id && other.qj === null) readyA++;
-              else if (other.qj === a.id && other.qk === a.id) readyA++;
-
-              if (other.qj === b.id && other.qk === null) readyB++;
-              else if (other.qk === b.id && other.qj === null) readyB++;
-              else if (other.qj === b.id && other.qk === b.id) readyB++;
+          .forEach((o) => {
+            if (o.busy) {
+              if (
+                (o.qj === a.id && o.qk === null) ||
+                (o.qk === a.id && o.qj === null) ||
+                (o.qj === a.id && o.qk === a.id)
+              )
+                readyA++;
+              if (
+                (o.qj === b.id && o.qk === null) ||
+                (o.qk === b.id && o.qj === null) ||
+                (o.qj === b.id && o.qk === b.id)
+              )
+                readyB++;
             }
           });
         if (readyA !== readyB) return readyB - readyA;
 
-        // 3. Static Type
-        const priority = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
-        return priority[b.type] - priority[a.type];
+        const p = { BRANCH: 4, STORE: 3, LOAD: 2, MULT: 1, ADD: 0 };
+        return p[b.type] - p[a.type];
       });
 
       const winner = writeCandidates[0];
 
-      // --- PROCESS WINNER ---
+      // Conflict Modal
+      if (writeCandidates.length > 1) {
+        const runnerUp = writeCandidates[1];
+        let reason = "";
+
+        // Re-calculate stats for reason string
+        let depW = 0,
+          depR = 0;
+        Object.values(next.rs)
+          .flat()
+          .forEach((o) => {
+            if (o.busy && (o.qj === winner.id || o.qk === winner.id)) depW++;
+            if (o.busy && (o.qj === runnerUp.id || o.qk === runnerUp.id))
+              depR++;
+          });
+
+        if (depW > depR)
+          reason = `More waiting instructions (${depW} vs ${depR}).`;
+        else reason = `Higher priority type or unblocks more units.`;
+
+        const losers = writeCandidates
+          .slice(1)
+          .map((c) => c.op)
+          .join(", ");
+        next.modalMsg = {
+          title: `Write Conflict at Cycle ${next.clock}`,
+          winner: `${winner.op}`,
+          losers: losers,
+          reason: reason,
+        };
+      }
+
       if (winner.type === "STORE") {
         next.memory[winner.address] = winner.vk;
       } else if (winner.type === "BRANCH") {
-        const targetAddr = parseInt(winner.address);
-        if (winner.result && !isNaN(targetAddr)) {
-          next.pc = targetAddr;
+        const tAddr = parseInt(winner.address);
+        if (winner.result && !isNaN(tAddr)) {
+          next.pc = tAddr;
           next.iteration++;
         }
         next.branchStall = false;
       } else {
-        const result = winner.result;
-        const rsId = winner.id;
+        const res = winner.result;
         Object.values(next.regs).forEach((r) => {
-          if (r.qi === rsId) {
-            r.val = result;
+          if (r.qi === winner.id) {
+            r.val = res;
             r.qi = null;
           }
         });
         Object.values(next.rs)
           .flat()
           .forEach((rs) => {
-            if (rs.qj === rsId) {
-              rs.vj = result;
+            if (rs.qj === winner.id) {
+              rs.vj = res;
               rs.qj = null;
             }
-            if (rs.qk === rsId) {
-              rs.vk = result;
+            if (rs.qk === winner.id) {
+              rs.vk = res;
               rs.qk = null;
             }
           });
       }
-
       next.instStatus[winner.instIdx].writeRes = next.clock;
-      const rsRef = next.rs[winner.type].find((r) => r.id === winner.id);
-      rsRef.busy = false;
-      rsRef.state = "IDLE";
-      rsRef.instIdx = -1;
+
+      // Reset RS
+      const typeList = next.rs[winner.type];
+      const rsIndex = typeList.findIndex((r) => r.id === winner.id);
+      if (rsIndex !== -1) {
+        typeList[rsIndex] = {
+          ...typeList[rsIndex],
+          busy: false,
+          state: "IDLE",
+          instIdx: -1,
+          op: "",
+          vj: null,
+          vk: null,
+          qj: null,
+          qk: null,
+          address: null,
+        };
+      }
     }
 
-    // --- PHASE 2: EXECUTE ---
+    // 2. EXECUTE
     Object.values(next.rs)
       .flat()
       .forEach((u) => {
         if (!u.busy) return;
 
-        // START EXECUTION?
         if (u.state === "ISSUE" && u.qj === null && u.qk === null) {
           u.state = "EXEC";
-
-          // Record Start Cycle
           next.instStatus[u.instIdx].execStart = next.clock;
 
-          // Addr Calc
           if (u.type === "LOAD" || u.type === "STORE") {
             u.address = (u.vj || 0) + (u.address || 0);
           }
 
-          // Cache Calc
           if (u.type === "LOAD") {
             const addr = u.address;
-            const blockIdxRaw = Math.floor(addr / next.config.cache.blockSize);
+            const rawIdx = Math.floor(addr / next.config.cache.blockSize);
             const n = next.cache.length;
-            const blockIdx = ((blockIdxRaw % n) + n) % n;
-            const tag = Math.floor(blockIdxRaw / n);
+            const blockIdx = ((rawIdx % n) + n) % n;
+            const tag = Math.floor(rawIdx / n);
 
             if (next.cache[blockIdx]) {
-              const block = next.cache[blockIdx];
-              const isHit = block.valid && block.tag === tag;
-
-              if (isHit) {
+              const blk = next.cache[blockIdx];
+              if (blk.valid && blk.tag === tag) {
                 u.timer = next.config.cache.hitLatency;
-                block.history.push(`Hit C${next.clock}`);
+                blk.history.push(`Hit C${next.clock}`);
               } else {
                 u.timer =
                   next.config.cache.hitLatency + next.config.cache.missPenalty;
                 next.cache[blockIdx] = {
-                  ...block,
+                  ...blk,
                   valid: true,
                   tag,
-                  data: `Mem[${Math.floor(addr / 8) * 8}]`,
-                  history: [...block.history, `Miss C${next.clock}`],
+                  data: `M[${Math.floor(addr / 8) * 8}]`,
+                  history: [...blk.history, `Miss C${next.clock}`],
                 };
               }
+            } else {
+              u.timer = next.config.cache.missPenalty;
             }
           }
         }
 
         if (u.state === "EXEC") {
           if (u.timer > 0) u.timer--;
-
           if (u.timer === 0) {
             u.state = "WRITE_READY";
             next.instStatus[u.instIdx].execComp = next.clock;
 
-            // Results
-            if (u.type === "LOAD")
-              u.result =
-                next.memory[u.address] !== undefined
-                  ? next.memory[u.address]
-                  : 0;
+            if (u.type === "LOAD") u.result = next.memory[u.address] ?? 0;
             else if (["ADD.D", "ADDI", "DADDI", "DADDIU"].includes(u.op))
-              u.result = parseFloat(u.vj) + parseFloat(u.vk);
+              u.result = (parseFloat(u.vj) || 0) + (parseFloat(u.vk) || 0);
             else if (["SUB.D", "SUBI", "DSUBI"].includes(u.op))
-              u.result = parseFloat(u.vj) - parseFloat(u.vk);
+              u.result = (parseFloat(u.vj) || 0) - (parseFloat(u.vk) || 0);
             else if (u.op === "MUL.D")
-              u.result = parseFloat(u.vj) * parseFloat(u.vk);
+              u.result = (parseFloat(u.vj) || 0) * (parseFloat(u.vk) || 0);
             else if (u.op === "DIV.D")
-              u.result = parseFloat(u.vj) / parseFloat(u.vk);
+              u.result = (parseFloat(u.vj) || 0) / (parseFloat(u.vk) || 1);
             else if (u.op === "DSLTU") u.result = u.vj < u.vk ? 1 : 0;
+            else if (u.type === "BRANCH") {
+              const v1 = u.vj || 0,
+                v2 = u.vk || 0;
+              if (u.op === "BNE") u.result = v1 !== v2;
+              else if (u.op === "BEQ") u.result = v1 === v2;
+              else if (u.op === "BNEZ") u.result = v1 !== 0;
+              else if (u.op === "BEQZ") u.result = v1 === 0;
+            }
           }
         }
       });
 
-    // --- PHASE 3: ISSUE ---
+    // 3. ISSUE
     if (!next.branchStall && next.pc < next.instructions.length) {
       const inst = next.instructions[next.pc];
-      const getReg = (rName) => {
-        if (rName.match(/^[RF]\d+$/)) return next.regs[rName];
-        return { val: parseInt(rName) || 0, qi: null };
-      };
+      const getReg = (r) =>
+        r.match(/^[RF]\d+$/)
+          ? next.regs[r]
+          : { val: parseInt(r) || 0, qi: null };
 
       if (inst.type === "BRANCH") {
-        const [Op1, Op2, Label] = inst.tokens;
-        const r1 = getReg(Op1);
-        let r2 = { val: 0, qi: null };
-        if (inst.op !== "BNEZ" && inst.op !== "BEQZ") r2 = getReg(Op2);
+        const [op1, op2, lbl] = inst.tokens;
+        const r1 = getReg(op1);
+        const r2 = ["BNEZ", "BEQZ"].includes(inst.op)
+          ? { val: 0, qi: null }
+          : getReg(op2);
 
-        if (r1.qi !== null || r2.qi !== null) {
+        if (r1.qi || r2.qi) {
           next.stalledPc = next.pc;
         } else {
-          // Execute Immediately (Bypass)
-          const val1 = r1.val;
-          const val2 = r2.val;
+          // Instant Execute (Bypass)
           let taken = false;
-          if (inst.op === "BNE") taken = val1 !== val2;
-          else if (inst.op === "BEQ") taken = val1 === val2;
-          else if (inst.op === "BNEZ") taken = val1 !== 0;
-          else if (inst.op === "BEQZ") taken = val1 === 0;
-
-          // NO Entry in Status Table for Branch
+          const v1 = r1.val,
+            v2 = r2.val;
+          if (inst.op === "BNE") taken = v1 !== v2;
+          else if (inst.op === "BEQ") taken = v1 === v2;
+          else if (inst.op === "BNEZ") taken = v1 !== 0;
+          else if (inst.op === "BEQZ") taken = v1 === 0;
 
           if (taken) {
-            let tLabel = inst.op.endsWith("Z") ? Op2 : Label;
+            const tLabel = ["BNEZ", "BEQZ"].includes(inst.op) ? op2 : lbl;
             const tAddr = parseInt(tLabel);
             if (!isNaN(tAddr)) {
               next.pc = tAddr;
               next.iteration++;
             } else next.pc++;
-          } else {
-            next.pc++;
-          }
+          } else next.pc++;
         }
       } else {
-        // RS Issue
-        let rsType = "ADD";
-        if (["MUL.D", "DIV.D"].includes(inst.op)) rsType = "MULT";
-        else if (inst.type === "LOAD") rsType = "LOAD";
-        else if (inst.type === "STORE") rsType = "STORE";
+        let type = "ADD";
+        if (["MUL.D", "DIV.D"].includes(inst.op)) type = "MULT";
+        else if (inst.type === "LOAD") type = "LOAD";
+        else if (inst.type === "STORE") type = "STORE";
 
-        const freeUnit = next.rs[rsType].find((u) => !u.busy);
+        const unit = next.rs[type].find((u) => !u.busy);
+        if (unit) {
+          unit.busy = true;
+          unit.op = inst.op;
+          unit.timer = next.config.latencies[inst.op] || 1;
+          unit.state = "ISSUE";
 
-        if (freeUnit) {
-          freeUnit.busy = true;
-          freeUnit.op = inst.op;
-          freeUnit.timer = next.config.latencies[inst.op] || 1;
-          freeUnit.state = "ISSUE";
-
-          const statusEntry = {
+          const stat = {
             id: next.instStatus.length,
             iter: next.iteration,
             text: inst.text,
@@ -441,67 +510,64 @@ const reducer = (state, action) => {
             execComp: "",
             writeRes: "",
           };
-          freeUnit.instIdx = statusEntry.id;
+          unit.instIdx = stat.id;
+          next.instStatus.push(stat);
 
           if (inst.type === "LOAD") {
-            const [dest, offsetStr] = inst.tokens;
-            const match = offsetStr.match(/(-?\d+)\(([A-Z0-9]+)\)/);
-            const offset = parseInt(match?.[1] || offsetStr);
-            const baseReg = match?.[2] || "R0";
-            const rBase = getReg(baseReg);
-            if (rBase.qi) {
-              freeUnit.qj = rBase.qi;
-              statusEntry.j = rBase.qi;
+            const [dest, offStr] = inst.tokens;
+            const m = offStr.match(/(-?\d+)\(([A-Z0-9]+)\)/);
+            const off = parseInt(m?.[1] || offStr);
+            const base = getReg(m?.[2] || "R0");
+            if (base.qi) {
+              unit.qj = base.qi;
+              stat.j = base.qi;
             } else {
-              freeUnit.vj = rBase.val;
-              statusEntry.j = rBase.val;
+              unit.vj = base.val;
+              stat.j = base.val;
             }
-            if (freeUnit.qj === null) freeUnit.address = offset + freeUnit.vj;
-            next.regs[dest].qi = freeUnit.id;
+            unit.address = off;
+            next.regs[dest].qi = unit.id;
           } else if (inst.type === "STORE") {
-            const [src, offsetStr] = inst.tokens;
-            const rSrc = getReg(src);
-            const match = offsetStr.match(/(-?\d+)\(([A-Z0-9]+)\)/);
-            const offset = parseInt(match?.[1] || offsetStr);
-            const baseReg = match?.[2] || "R0";
-            const rBase = getReg(baseReg);
-            if (rBase.qi) {
-              freeUnit.qj = rBase.qi;
-              statusEntry.j = rBase.qi;
+            const [src, offStr] = inst.tokens;
+            const m = offStr.match(/(-?\d+)\(([A-Z0-9]+)\)/);
+            const off = parseInt(m?.[1] || offStr);
+            const base = getReg(m?.[2] || "R0");
+            const val = getReg(src);
+            if (base.qi) {
+              unit.qj = base.qi;
+              stat.j = base.qi;
             } else {
-              freeUnit.vj = rBase.val;
-              statusEntry.j = rBase.val;
+              unit.vj = base.val;
+              stat.j = base.val;
             }
-            if (rSrc.qi) {
-              freeUnit.qk = rSrc.qi;
-              statusEntry.k = rSrc.qi;
+            if (val.qi) {
+              unit.qk = val.qi;
+              stat.k = val.qi;
             } else {
-              freeUnit.vk = rSrc.val;
-              statusEntry.k = rSrc.val;
+              unit.vk = val.val;
+              stat.k = val.val;
             }
-            freeUnit.address = offset;
-            if (freeUnit.qj === null) freeUnit.address += freeUnit.vj;
+            unit.address = off;
           } else {
             const [dest, s1, s2] = inst.tokens;
             const r1 = getReg(s1);
             const r2 = getReg(s2);
             if (r1.qi) {
-              freeUnit.qj = r1.qi;
-              statusEntry.j = r1.qi;
+              unit.qj = r1.qi;
+              stat.j = r1.qi;
             } else {
-              freeUnit.vj = r1.val;
-              statusEntry.j = r1.val;
+              unit.vj = r1.val;
+              stat.j = r1.val;
             }
             if (r2.qi) {
-              freeUnit.qk = r2.qi;
-              statusEntry.k = r2.qi;
+              unit.qk = r2.qi;
+              stat.k = r2.qi;
             } else {
-              freeUnit.vk = r2.val;
-              statusEntry.k = r2.val;
+              unit.vk = r2.val;
+              stat.k = r2.val;
             }
-            next.regs[dest].qi = freeUnit.id;
+            next.regs[dest].qi = unit.id;
           }
-          next.instStatus.push(statusEntry);
           next.pc++;
         }
       }
@@ -511,7 +577,352 @@ const reducer = (state, action) => {
   return state;
 };
 
-// --- COMPONENTS ---
+// ==========================================
+// 4. SUB-COMPONENTS
+// ==========================================
+
+const ConflictModal = ({ msg, onClose }) => {
+  if (!msg) return null;
+  return (
+    <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-800 border border-gray-600 rounded-xl shadow-2xl max-w-md w-full p-6 relative animate-in fade-in zoom-in duration-200">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 bg-yellow-900/50 rounded-full border border-yellow-600">
+            <AlertTriangle className="text-yellow-500" size={24} />
+          </div>
+          <h2 className="text-lg font-bold text-gray-100">{msg.title}</h2>
+        </div>
+
+        <div className="space-y-4 mb-6">
+          <div className="bg-green-900/30 border border-green-800 p-3 rounded-lg">
+            <p className="text-xs text-green-400 uppercase font-bold mb-1">
+              Winner
+            </p>
+            <p className="text-sm font-mono text-white">{msg.winner}</p>
+          </div>
+
+          <div className="bg-red-900/20 border border-red-900/50 p-3 rounded-lg">
+            <p className="text-xs text-red-400 uppercase font-bold mb-1">
+              Stalled
+            </p>
+            <p className="text-sm font-mono text-gray-300">{msg.losers}</p>
+          </div>
+
+          <div className="text-sm text-gray-300">
+            <span className="font-bold text-blue-400">Reason:</span>{" "}
+            {msg.reason}
+          </div>
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            onClick={onClose}
+            className="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-lg font-bold shadow-lg transition-colors"
+          >
+            Acknowledged
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const InstructionBuilder = ({ onCodeChange, defaultInstructions }) => {
+  const [rows, setRows] = useState(() => {
+    const lines = defaultInstructions.split("\n");
+    return lines.map((l, i) => {
+      const p = parseInstruction(l);
+      if (!p)
+        return {
+          id: i,
+          label: "",
+          op: "ADD.D",
+          dest: "F0",
+          s1: "F1",
+          s2: "F2",
+        };
+
+      const isLoadStore = ["LOAD", "STORE"].includes(p.type);
+      const isBranch = p.type === "BRANCH";
+      const isBranchZ = ["BNEZ", "BEQZ"].includes(p.op);
+
+      let dest = "",
+        s1 = "",
+        s2 = "";
+
+      if (isLoadStore) {
+        dest = p.tokens[0]?.replace(",", "") || "";
+        const m = p.tokens[1]?.match(/(-?\d+)\(([A-Z0-9]+)\)/);
+        if (m) {
+          s1 = m[1];
+          s2 = m[2];
+        } else {
+          s1 = p.tokens[1] || "0";
+          s2 = "R0";
+        }
+      } else if (isBranch) {
+        dest = p.tokens[0]?.replace(",", "") || "";
+        if (isBranchZ) {
+          s1 = p.tokens[1] || "";
+        } else {
+          s1 = p.tokens[1]?.replace(",", "") || "";
+          s2 = p.tokens[2] || "";
+        }
+      } else {
+        dest = p.tokens[0]?.replace(",", "") || "";
+        s1 = p.tokens[1]?.replace(",", "") || "";
+        s2 = p.tokens[2] || "";
+      }
+
+      return {
+        id: Date.now() + i,
+        label: p.label || "",
+        op: p.op,
+        dest,
+        s1,
+        s2,
+      };
+    });
+  });
+
+  useEffect(() => {
+    const text = rows
+      .map((r) => {
+        const lbl = r.label ? `${r.label}: ` : "";
+        const op = r.op;
+        let args = "";
+        const isLS = [
+          "L.D",
+          "L.S",
+          "LW",
+          "LD",
+          "S.D",
+          "S.S",
+          "SW",
+          "SD",
+        ].includes(op);
+        const isBZ = ["BNEZ", "BEQZ"].includes(op);
+        const isB = ["BNE", "BEQ"].includes(op);
+        const isImm = [
+          "ADDI",
+          "SUBI",
+          "DADDI",
+          "DSUBI",
+          "DADDIU",
+          "DSLTU",
+        ].includes(op);
+
+        if (isLS) {
+          args = `${r.dest}, ${r.s1}(${r.s2})`;
+        } else if (isBZ) {
+          args = `${r.dest}, ${r.s1}`;
+        } else if (isImm) {
+          args = `${r.dest}, ${r.s1}, ${r.s2}`;
+        } else {
+          args = `${r.dest}, ${r.s1}, ${r.s2}`;
+        }
+        return `${lbl}${op} ${args}`;
+      })
+      .join("\n");
+    onCodeChange(text);
+  }, [rows, onCodeChange]);
+
+  const addRow = () =>
+    setRows([
+      ...rows,
+      {
+        id: Date.now(),
+        label: "",
+        op: "ADD.D",
+        dest: "F0",
+        s1: "F2",
+        s2: "F4",
+      },
+    ]);
+  const removeRow = (id) => setRows(rows.filter((r) => r.id !== id));
+  const updateRow = (id, field, val) =>
+    setRows(rows.map((r) => (r.id === id ? { ...r, [field]: val } : r)));
+
+  const ALL_REGS = [
+    ...Array.from({ length: 32 }, (_, i) => `F${i}`),
+    ...Array.from({ length: 32 }, (_, i) => `R${i}`),
+  ];
+
+  return (
+    <div className="bg-gray-900 border border-gray-700 rounded-lg p-4 h-96 flex flex-col">
+      <div className="flex justify-between items-center mb-2">
+        <h3 className="text-sm font-bold text-gray-400 uppercase flex items-center gap-2">
+          <Code size={14} /> Instruction Builder
+        </h3>
+        <button
+          onClick={addRow}
+          className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded flex items-center gap-1"
+        >
+          <Plus size={12} /> Add
+        </button>
+      </div>
+      <div className="overflow-y-auto custom-scrollbar flex-1 space-y-1">
+        {/* Headers */}
+        <div className="grid grid-cols-[30px_80px_90px_70px_70px_70px_30px] gap-2 px-1 py-2 text-[10px] font-bold text-gray-500 uppercase border-b border-gray-800 mb-1">
+          <div className="text-center">#</div>
+          <div>Label</div>
+          <div>Opcode</div>
+          <div>Dest/Op1</div>
+          <div>Src1/Off</div>
+          <div>Src2/Base</div>
+          <div></div>
+        </div>
+
+        {rows.map((r, idx) => {
+          const isLS = [
+            "L.D",
+            "L.S",
+            "LW",
+            "LD",
+            "S.D",
+            "S.S",
+            "SW",
+            "SD",
+          ].includes(r.op);
+          const isBranch = ["BNE", "BEQ", "BNEZ", "BEQZ"].includes(r.op);
+          const isBZ = ["BNEZ", "BEQZ"].includes(r.op);
+          const isImm = [
+            "ADDI",
+            "SUBI",
+            "DADDI",
+            "DSUBI",
+            "DADDIU",
+            "DSLTU",
+          ].includes(r.op);
+
+          return (
+            <div
+              key={r.id}
+              className="grid grid-cols-[30px_80px_90px_70px_70px_70px_30px] gap-2 items-center p-1.5 rounded hover:bg-gray-800 transition-colors group"
+            >
+              <div className="text-gray-600 text-[10px] font-mono text-center">
+                {idx}
+              </div>
+
+              <input
+                placeholder="Label"
+                className="bg-transparent border border-transparent hover:border-gray-700 focus:border-blue-500 rounded px-1.5 py-1 text-xs text-yellow-500 placeholder-gray-700 outline-none transition-all font-mono"
+                value={r.label}
+                onChange={(e) => updateRow(r.id, "label", e.target.value)}
+              />
+
+              <div className="relative">
+                <select
+                  className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-blue-300 font-bold outline-none focus:border-blue-500 cursor-pointer"
+                  value={r.op}
+                  onChange={(e) => updateRow(r.id, "op", e.target.value)}
+                >
+                  {OPCODES.map((o) => (
+                    <option key={o} value={o}>
+                      {o}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="relative">
+                <select
+                  className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none focus:border-blue-500 cursor-pointer"
+                  value={r.dest}
+                  onChange={(e) => updateRow(r.id, "dest", e.target.value)}
+                >
+                  {ALL_REGS.map((rg) => (
+                    <option key={rg} value={rg}>
+                      {rg}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {isLS ? (
+                <input
+                  placeholder="Off"
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-green-400 outline-none focus:border-blue-500"
+                  value={r.s1}
+                  onChange={(e) => updateRow(r.id, "s1", e.target.value)}
+                />
+              ) : isBZ ? (
+                <input
+                  placeholder="Label"
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-yellow-400 outline-none focus:border-blue-500"
+                  value={r.s1}
+                  onChange={(e) => updateRow(r.id, "s1", e.target.value)}
+                />
+              ) : (
+                <select
+                  className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none focus:border-blue-500 cursor-pointer"
+                  value={r.s1}
+                  onChange={(e) => updateRow(r.id, "s1", e.target.value)}
+                >
+                  {ALL_REGS.map((rg) => (
+                    <option key={rg} value={rg}>
+                      {rg}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              {isLS ? (
+                <select
+                  className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-400 outline-none focus:border-blue-500 cursor-pointer"
+                  value={r.s2}
+                  onChange={(e) => updateRow(r.id, "s2", e.target.value)}
+                >
+                  {ALL_REGS.map((rg) => (
+                    <option key={rg} value={rg}>
+                      {rg}
+                    </option>
+                  ))}
+                </select>
+              ) : isBZ ? (
+                <div></div>
+              ) : isBranch ? (
+                <input
+                  placeholder="Label"
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-yellow-400 outline-none focus:border-blue-500"
+                  value={r.s2}
+                  onChange={(e) => updateRow(r.id, "s2", e.target.value)}
+                />
+              ) : isImm ? (
+                <input
+                  placeholder="#Imm"
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-green-400 outline-none focus:border-blue-500"
+                  value={r.s2}
+                  onChange={(e) => updateRow(r.id, "s2", e.target.value)}
+                />
+              ) : (
+                <select
+                  className="w-full appearance-none bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none focus:border-blue-500 cursor-pointer"
+                  value={r.s2}
+                  onChange={(e) => updateRow(r.id, "s2", e.target.value)}
+                >
+                  <option value="#8">#8</option>
+                  {ALL_REGS.map((rg) => (
+                    <option key={rg} value={rg}>
+                      {rg}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              <button
+                onClick={() => removeRow(r.id)}
+                className="text-gray-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 flex justify-center"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
 
 const CodeTable = ({ instructions, pc, stalledPc }) => (
   <div className="overflow-auto h-32 bg-gray-900 rounded-lg border border-gray-700 shadow-lg custom-scrollbar shrink-0">
@@ -707,23 +1118,16 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
   const [config, setConfig] = useState(initialConfig || DEFAULT_CONFIG);
   const [code, setCode] = useState(initialCode || DEFAULT_CODE);
 
-  // Helper to handle input updates robustly
   const update = (path, val) => {
     const c = JSON.parse(JSON.stringify(config));
     let ref = c;
     const parts = path.split(".");
     while (parts.length > 1) ref = ref[parts.shift()];
-
-    // Handle empty strings for controlled inputs (prevents NaN lock)
-    if (val === "") {
-      ref[parts[0]] = "";
-    } else {
-      ref[parts[0]] = parseInt(val) || 0;
-    }
+    if (val === "") ref[parts[0]] = "";
+    else ref[parts[0]] = parseInt(val) || 0;
     setConfig(c);
   };
 
-  // Helper to update a group of latencies at once
   const updateGroupLatency = (ops, val) => {
     const c = JSON.parse(JSON.stringify(config));
     const newVal = val === "" ? "" : parseInt(val) || 0;
@@ -733,46 +1137,46 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
 
   return (
     <div className="min-h-screen bg-gray-950 p-8 font-sans text-gray-200">
-      <div className="max-w-5xl mx-auto bg-gray-900 rounded-xl shadow-2xl border border-gray-800 overflow-hidden">
+      <div className="max-w-6xl mx-auto bg-gray-900 rounded-xl shadow-2xl border border-gray-800 overflow-hidden">
         <div className="bg-gray-800 p-6 flex justify-between items-center border-b border-gray-700">
           <div>
             <h1 className="text-2xl font-bold text-blue-400">
               CSEN 702: Tomasulo Simulator
             </h1>
             <p className="text-gray-400 text-sm">
-              Configure your architecture environment
+              Configure architecture & Build Instruction Trace
             </p>
           </div>
           <Cpu size={40} className="text-blue-500 opacity-80" />
         </div>
 
-        <div className="p-6 grid grid-cols-2 gap-8">
-          {/* Left: Code */}
-          <div>
-            <h3 className="font-bold text-gray-300 mb-3 flex items-center gap-2 text-sm uppercase tracking-wider">
-              <Terminal size={16} className="text-blue-400" /> Assembly Code
-            </h3>
-            <textarea
-              className="w-full h-96 p-4 font-mono text-sm bg-gray-950 text-green-400 rounded-lg border border-gray-700 focus:ring-2 ring-blue-500/50 outline-none resize-none"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              spellCheck="false"
+        <div className="p-6 grid grid-cols-12 gap-8">
+          <div className="col-span-5">
+            <InstructionBuilder
+              onCodeChange={setCode}
+              defaultInstructions={code}
             />
-            <div className="mt-3 text-xs text-gray-500">
-              Supported: L.D, S.D, ADD.D, MUL.D, DIV.D, BNE, DADDI, etc.
+            <div className="mt-2 text-xs text-gray-600 flex justify-between items-center">
+              <span>Generated Assembly Preview:</span>
+              <button className="text-blue-500 hover:underline flex items-center gap-1">
+                <FileText size={10} /> Load File
+              </button>
             </div>
+            <pre className="mt-1 bg-black/50 p-2 rounded text-[10px] text-green-400 font-mono h-24 overflow-auto border border-gray-800">
+              {code}
+            </pre>
           </div>
 
-          {/* Right: Settings */}
-          <div className="space-y-6 overflow-y-auto h-96 pr-2 custom-scrollbar">
-            {/* Latencies Grouped */}
+          <div className="col-span-7 space-y-6 overflow-y-auto h-[500px] pr-2 custom-scrollbar">
             <div className="bg-gray-800/50 p-4 rounded-lg border border-gray-700">
               <h4 className="font-bold text-gray-400 text-xs mb-3 uppercase border-b border-gray-700 pb-2">
-                Latencies (Cycles)
+                Latencies
               </h4>
-              <div className="space-y-3">
-                <label className="text-xs font-semibold text-gray-500 block">
-                  Add / Sub Unit (FP & Int)
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <label className="text-[10px] font-bold text-gray-500 block uppercase">
+                    Add/Sub Unit
+                  </label>
                   <input
                     type="number"
                     value={config.latencies["ADD.D"]}
@@ -780,9 +1184,7 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
                       updateGroupLatency(
                         [
                           "ADD.D",
-                          "ADD.S",
                           "SUB.D",
-                          "SUB.S",
                           "ADDI",
                           "SUBI",
                           "DADDI",
@@ -793,133 +1195,148 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
                         e.target.value
                       )
                     }
-                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
+                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-blue-400 font-bold"
                   />
-                </label>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="text-xs font-semibold text-gray-500 block">
-                    Multiplication
-                    <input
-                      type="number"
-                      value={config.latencies["MUL.D"]}
-                      onChange={(e) =>
-                        updateGroupLatency(["MUL.D", "MUL.S"], e.target.value)
-                      }
-                      className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                    />
-                  </label>
-                  <label className="text-xs font-semibold text-gray-500 block">
-                    Division
-                    <input
-                      type="number"
-                      value={config.latencies["DIV.D"]}
-                      onChange={(e) =>
-                        updateGroupLatency(["DIV.D", "DIV.S"], e.target.value)
-                      }
-                      className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                    />
-                  </label>
                 </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="text-xs font-semibold text-gray-500 block">
-                    Load
-                    <input
-                      type="number"
-                      value={config.latencies["L.D"]}
-                      onChange={(e) =>
-                        updateGroupLatency(
-                          ["L.D", "L.S", "LW", "LD"],
-                          e.target.value
-                        )
-                      }
-                      className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                    />
+                <div>
+                  <label className="text-[10px] font-bold text-gray-500 block uppercase">
+                    Multiplier
                   </label>
-                  <label className="text-xs font-semibold text-gray-500 block">
-                    Store
-                    <input
-                      type="number"
-                      value={config.latencies["S.D"]}
-                      onChange={(e) =>
-                        updateGroupLatency(
-                          ["S.D", "S.S", "SW", "SD"],
-                          e.target.value
-                        )
-                      }
-                      className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                    />
-                  </label>
-                </div>
-              </div>
-            </div>
-
-            {/* RS Sizes */}
-            <div className="bg-gray-800/50 p-4 rounded-lg border border-gray-700">
-              <h4 className="font-bold text-gray-400 text-xs mb-3 uppercase border-b border-gray-700 pb-2">
-                Buffer Sizes
-              </h4>
-              <div className="grid grid-cols-4 gap-3">
-                {["ADD", "MULT", "LOAD", "STORE"].map((type) => (
-                  <label
-                    key={type}
-                    className="text-xs font-semibold text-gray-500 block"
-                  >
-                    {type}
-                    <input
-                      type="number"
-                      value={config.rsSize[type]}
-                      onChange={(e) => update(`rsSize.${type}`, e.target.value)}
-                      className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                    />
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            {/* Cache Config */}
-            <div className="bg-blue-900/10 p-4 rounded-lg border border-blue-900/30">
-              <h4 className="font-bold text-blue-400 text-xs mb-3 uppercase border-b border-blue-900/30 pb-2 flex items-center gap-2">
-                <MemoryStick size={14} /> Cache Config
-              </h4>
-              <div className="grid grid-cols-2 gap-3">
-                <label className="text-xs font-semibold text-gray-500 block">
-                  Size (Bytes)
                   <input
                     type="number"
-                    value={config.cache.size}
-                    onChange={(e) => update(`cache.size`, e.target.value)}
-                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                  />
-                </label>
-                <label className="text-xs font-semibold text-gray-500 block">
-                  Block Size (Bytes)
-                  <input
-                    type="number"
-                    value={config.cache.blockSize}
-                    onChange={(e) => update(`cache.blockSize`, e.target.value)}
-                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                  />
-                </label>
-                <label className="text-xs font-semibold text-gray-500 block">
-                  Hit Time
-                  <input
-                    type="number"
-                    value={config.cache.hitLatency}
-                    onChange={(e) => update(`cache.hitLatency`, e.target.value)}
-                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
-                  />
-                </label>
-                <label className="text-xs font-semibold text-gray-500 block">
-                  Miss Penalty
-                  <input
-                    type="number"
-                    value={config.cache.missPenalty}
+                    value={config.latencies["MUL.D"]}
                     onChange={(e) =>
-                      update(`cache.missPenalty`, e.target.value)
+                      updateGroupLatency(["MUL.D", "MUL.S"], e.target.value)
                     }
-                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none"
+                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-blue-400 font-bold"
                   />
-                </label>
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-gray-500 block uppercase">
+                    Divider
+                  </label>
+                  <input
+                    type="number"
+                    value={config.latencies["DIV.D"]}
+                    onChange={(e) =>
+                      updateGroupLatency(["DIV.D", "DIV.S"], e.target.value)
+                    }
+                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-blue-400 font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-gray-500 block uppercase">
+                    Load Unit
+                  </label>
+                  <input
+                    type="number"
+                    value={config.latencies["L.D"]}
+                    onChange={(e) =>
+                      updateGroupLatency(
+                        ["L.D", "L.S", "LW", "LD"],
+                        e.target.value
+                      )
+                    }
+                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-blue-400 font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-gray-500 block uppercase">
+                    Store Unit
+                  </label>
+                  <input
+                    type="number"
+                    value={config.latencies["S.D"]}
+                    onChange={(e) =>
+                      updateGroupLatency(
+                        ["S.D", "S.S", "SW", "SD"],
+                        e.target.value
+                      )
+                    }
+                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-blue-400 font-bold"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-gray-800/50 p-4 rounded-lg border border-gray-700">
+                <h4 className="font-bold text-gray-400 text-xs mb-3 uppercase border-b border-gray-700 pb-2">
+                  Buffer Sizes
+                </h4>
+                <div className="space-y-2">
+                  {["ADD", "MULT", "LOAD", "STORE"].map((t) => (
+                    <div key={t} className="flex justify-between items-center">
+                      <span className="text-xs text-gray-500 font-bold">
+                        {t}
+                      </span>
+                      <input
+                        type="number"
+                        value={config.rsSize[t]}
+                        onChange={(e) => update(`rsSize.${t}`, e.target.value)}
+                        className="w-16 bg-gray-900 border border-gray-700 rounded p-1 text-center text-white"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="bg-blue-900/10 p-4 rounded-lg border border-blue-900/30">
+                <h4 className="font-bold text-blue-400 text-xs mb-3 uppercase border-b border-blue-900/30 pb-2 flex items-center gap-2">
+                  <MemoryStick size={14} /> Cache
+                </h4>
+                <div className="space-y-2">
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-gray-500 font-bold">
+                      Size (B)
+                    </span>
+                    <input
+                      type="number"
+                      value={config.cache.size}
+                      onChange={(e) => update(`cache.size`, e.target.value)}
+                      className="w-16 bg-gray-900 border border-gray-700 rounded p-1 text-center text-white"
+                    />
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-gray-500 font-bold">
+                      Block (B)
+                    </span>
+                    <input
+                      type="number"
+                      value={config.cache.blockSize}
+                      onChange={(e) =>
+                        update(`cache.blockSize`, e.target.value)
+                      }
+                      className="w-16 bg-gray-900 border border-gray-700 rounded p-1 text-center text-white"
+                    />
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-gray-500 font-bold">
+                      Hit Lat.
+                    </span>
+                    <input
+                      type="number"
+                      value={config.cache.hitLatency}
+                      onChange={(e) =>
+                        update(`cache.hitLatency`, e.target.value)
+                      }
+                      className="w-16 bg-gray-900 border border-gray-700 rounded p-1 text-center text-white"
+                    />
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-gray-500 font-bold">
+                      Miss Pen.
+                    </span>
+                    <input
+                      type="number"
+                      value={config.cache.missPenalty}
+                      onChange={(e) =>
+                        update(`cache.missPenalty`, e.target.value)
+                      }
+                      className="w-16 bg-gray-900 border border-gray-700 rounded p-1 text-center text-white"
+                    />
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -937,7 +1354,11 @@ const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
   );
 };
 
-export default function TomasuloApp() {
+// ==========================================
+// 5. MAIN COMPONENT (EXPORT)
+// ==========================================
+
+const TomasuloSimulator = () => {
   const [config, setConfig] = useState(null);
   const [code, setCode] = useState(DEFAULT_CODE);
   const [state, dispatch] = useReducer(reducer, null);
@@ -986,10 +1407,16 @@ export default function TomasuloApp() {
         <div className="text-gray-500 font-mono">PC: {state.pc}</div>
       </div>
 
+      {state.modalMsg && (
+        <ConflictModal
+          msg={state.modalMsg}
+          onClose={() => dispatch({ type: "CLOSE_MODAL" })}
+        />
+      )}
+
       <div className="flex-1 flex overflow-hidden">
         {/* LEFT COLUMN: STATUS & CACHE */}
         <div className="flex-[3] flex flex-col p-2 gap-2 overflow-y-auto custom-scrollbar">
-          {/* Program Code Table */}
           <div className="bg-gray-900 p-3 rounded-lg shadow border border-gray-800 shrink-0">
             <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
               <Code size={14} /> Program Code
@@ -1001,7 +1428,6 @@ export default function TomasuloApp() {
             />
           </div>
 
-          {/* Instruction Status */}
           <div className="bg-gray-900 p-3 rounded-lg shadow border border-gray-800">
             <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
               <Layers size={14} /> Instruction Status
@@ -1009,7 +1435,6 @@ export default function TomasuloApp() {
             <StatusTable data={state.instStatus} />
           </div>
 
-          {/* RS Tables */}
           <div className="grid grid-cols-2 gap-2">
             {["ADD", "MULT", "LOAD", "STORE"].map((type) => (
               <div
@@ -1024,7 +1449,6 @@ export default function TomasuloApp() {
             ))}
           </div>
 
-          {/* Cache Viz */}
           <div className="bg-gray-900 p-3 rounded-lg shadow border border-gray-800">
             <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
               <MemoryStick size={14} /> Data Cache (Direct Mapped)
@@ -1035,7 +1459,6 @@ export default function TomasuloApp() {
 
         {/* RIGHT COLUMN: REGISTERS & MEMORY */}
         <div className="flex-1 min-w-[300px] bg-gray-900 border-l border-gray-800 p-2 flex flex-col gap-2 h-full overflow-hidden">
-          {/* FP Registers */}
           <div className="bg-gray-800/50 p-2 rounded border border-gray-700 flex-1 flex flex-col min-h-0">
             <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider sticky top-0 bg-gray-800/90 p-1">
               <Database size={14} /> Registers (FP)
@@ -1065,7 +1488,6 @@ export default function TomasuloApp() {
             </div>
           </div>
 
-          {/* Int Registers */}
           <div className="bg-gray-800/50 p-2 rounded border border-gray-700 flex-1 flex flex-col min-h-0">
             <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider sticky top-0 bg-gray-800/90 p-1">
               <Cpu size={14} /> Registers (Int)
@@ -1095,7 +1517,6 @@ export default function TomasuloApp() {
             </div>
           </div>
 
-          {/* Memory - Fixed Height, Scrollable */}
           <div className="bg-gray-800/50 p-2 rounded border border-gray-700 h-48 flex flex-col shrink-0">
             <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
               <Save size={14} /> Memory
@@ -1129,4 +1550,6 @@ export default function TomasuloApp() {
       </div>
     </div>
   );
-}
+};
+
+export default TomasuloSimulator;
