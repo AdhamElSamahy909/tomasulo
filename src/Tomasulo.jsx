@@ -92,13 +92,12 @@ const DEFAULT_CONFIG = {
   memorySize: 256,
 };
 
-const DEFAULT_CODE = `L.D F6, 0(R2)
-L.D F2, 8(R2)
-MUL.D F0, F2, F4
-SUB.D F8, F2, F6
-DIV.D F10, F0, F6
-ADD.D F6, F8, F2
-S.D F6, 8(R2) `;
+const DEFAULT_CODE = `MUL.D R3, R1, R2
+ADD.D R5, R3, R4
+ADD.D R7, R2, R6
+ADD.D R10, R8, R9
+MUL.D R11, R7, R10
+ADD.D R5, R5, R11`;
 
 // ==========================================
 // 2. UTILITIES
@@ -432,6 +431,23 @@ const reducer = (state, action) => {
                   u.subState = "MISS_PENALTY";
                   u.timer = next.config.cache.missPenalty;
                   blk.history.push(`Miss C${next.clock}`);
+
+                  // If miss penalty is zero, complete the fill immediately
+                  // instead of waiting an extra cycle. This avoids an
+                  // off-by-one when miss penalty is set to 0.
+                  if (u.timer === 0) {
+                    next.cache[blockIdx] = {
+                      ...next.cache[blockIdx],
+                      valid: true,
+                      tag,
+                      data: `M[${Math.floor(addr / 8) * 8}]`,
+                      history: [...next.cache[blockIdx].history, `Fill C${next.clock}`],
+                    };
+
+                    u.result = next.memory[addr] ?? 0;
+                    u.state = "WRITE_READY";
+                    next.instStatus[u.instIdx].execComp = next.clock;
+                  }
                 }
               } else {
                 u.timer = next.config.cache.missPenalty;
@@ -499,13 +515,13 @@ const reducer = (state, action) => {
           const val1 = r1.val;
           const val2 = r2.val;
           let taken = false;
-          if (inst.op === "BNE") taken = val1 !== v2;
-          else if (inst.op === "BEQ") taken = v1 === v2;
-          else if (inst.op === "BNEZ") taken = v1 !== 0;
-          else if (inst.op === "BEQZ") taken = v1 === 0;
+          if (inst.op === "BNE") taken = val1 !== val2;
+          else if (inst.op === "BEQ") taken = val1 === val2;
+          else if (inst.op === "BNEZ") taken = val1 !== 0;
+          else if (inst.op === "BEQZ") taken = val1 === 0;
 
           if (taken) {
-            const tLabel = ["BNEZ", "BEQZ"].includes(inst.op) ? op2 : lbl;
+            const tLabel = ["BNEZ", "BEQZ"].includes(inst.op) ? Op1 : Label;
             const tAddr = parseInt(tLabel);
             if (!isNaN(tAddr)) {
               next.pc = tAddr;
