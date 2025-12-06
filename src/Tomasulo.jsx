@@ -1,198 +1,150 @@
-import React, { useState, useReducer, useEffect, useRef } from "react";
+import React, { useState, useReducer } from "react";
 import {
-  Play,
   SkipForward,
   RotateCcw,
-  Settings,
   Cpu,
   Database,
   Layers,
   MemoryStick,
-  AlertCircle,
-  Edit3,
-  GitBranch,
-  Archive,
+  ArrowRight,
+  Save,
+  Terminal,
+  Play,
+  Settings
 } from "lucide-react";
 
-// --- UTILITIES & PARSING ---
-
-const PARSER_REGEX = {
-  MEM: /^([A-Z\.]+)\s+([RF]\d+)\s*,\s*(-?\d+)\(([RF]\d+)\)$/i,
-  ALU: /^([A-Z\.]+)\s+([RF]\d+)\s*,\s*([RF]\d+)\s*,\s*(?:#)?([RF0-9\.-]+)$/i,
-  BRANCH: /^(BNE|BEQ)\s+([RF]\d+)\s*,\s*([RF0-9]+)\s*,\s*([A-Z0-9]+)$/i,
-  BRANCH_Z: /^(BNEZ|BEQZ)\s+([RF]\d+)\s*,\s*([A-Z0-9]+)$/i, // Handle BNEZ R1, LOOP
-  LABEL: /^([A-Z0-9]+):?/i,
-};
-
-const parseInstruction = (line, index) => {
-  const cleanLine = line.trim().toUpperCase();
-  if (!cleanLine || cleanLine.startsWith(";")) return null;
-
-  let label = null;
-  let instruction = cleanLine;
-
-  const labelMatch = cleanLine.match(/^([A-Z0-9]+):/);
-  if (labelMatch) {
-    label = labelMatch[1];
-    instruction = cleanLine.substring(labelMatch[0].length).trim();
-    if (!instruction)
-      return { type: "LABEL", label, id: index, text: cleanLine };
-  } else if (cleanLine.match(/^[A-Z0-9]+$/)) {
-    return { type: "LABEL", label: cleanLine, id: index, text: cleanLine };
-  }
-
-  let match;
-  if ((match = instruction.match(PARSER_REGEX.MEM))) {
-    return {
-      id: index,
-      label,
-      text: instruction,
-      type: "MEM",
-      op: match[1],
-      dest: match[2],
-      imm: parseInt(match[3]),
-      rs: match[4],
-    };
-  } else if ((match = instruction.match(PARSER_REGEX.BRANCH))) {
-    return {
-      id: index,
-      label,
-      text: instruction,
-      type: "BRANCH",
-      op: match[1],
-      rs: match[2],
-      rt: match[3],
-      target: match[4],
-    };
-  } else if ((match = instruction.match(PARSER_REGEX.BRANCH_Z))) {
-    return {
-      id: index,
-      label,
-      text: instruction,
-      type: "BRANCH",
-      op: match[1],
-      rs: match[2],
-      rt: null,
-      target: match[3], // RT is null for Zero check
-    };
-  } else if ((match = instruction.match(PARSER_REGEX.ALU))) {
-    return {
-      id: index,
-      label,
-      text: instruction,
-      type: "ALU",
-      op: match[1],
-      dest: match[2],
-      src1: match[3],
-      src2: match[4],
-    };
-  }
-
-  return { id: index, label, text: instruction, type: "UNKNOWN" };
-};
-
-const STORE_OPS = ["S.D", "S.S", "SW", "SD"];
-const LOAD_OPS = ["L.D", "L.S", "LW", "LD"];
-const BRANCH_OPS = ["BNE", "BEQ", "BNEZ", "BEQZ"];
-
-// --- INITIAL CONFIGURATION ---
+// --- CONSTANTS & CONFIG ---
 
 const DEFAULT_CONFIG = {
   rsSize: { ADD: 3, MULT: 2, LOAD: 3, STORE: 3 },
   latencies: {
-    "L.D": 2,
-    "L.S": 2,
-    LW: 2,
-    LD: 2,
-    "S.D": 2,
-    "S.S": 2,
-    SW: 2,
-    SD: 2,
-    "ADD.D": 2,
-    "ADD.S": 2,
-    "SUB.D": 2,
-    "SUB.S": 2,
-    ADDI: 2,
-    SUBI: 2,
-    DADDI: 2,
-    DSUBI: 2,
-    "MUL.D": 10,
-    "MUL.S": 10,
-    "DIV.D": 40,
-    "DIV.S": 40,
-    BNE: 1,
-    BEQ: 1,
-    BNEZ: 1,
+    "L.D": 2, "L.S": 2, "LW": 2, "LD": 2,
+    "S.D": 2, "S.S": 2, "SW": 2, "SD": 2,
+    "ADD.D": 2, "ADD.S": 2, "SUB.D": 2, "SUB.S": 2,
+    "ADDI": 2, "SUBI": 2, "DADDI": 2, "DSUBI": 2,
+    "MUL.D": 10, "MUL.S": 10, "DIV.D": 40, "DIV.S": 40,
+    "BNE": 1, "BEQ": 1, "BNEZ": 1, "BEQZ": 1
   },
   cache: {
     enabled: true,
-    size: 64,
-    blockSize: 8,
+    size: 64,       // Total bytes
+    blockSize: 8,   // Bytes per block
     hitLatency: 1,
-    missPenalty: 10,
+    missPenalty: 10
   },
-  memorySize: 128,
+  memorySize: 256
 };
 
-const DEFAULT_CODE = `LOOP: L.D   F0, 0(R1)
-      MUL.D F4, F0, F2
-      S.D   F4, 0(R1)
-      SUBI  R1, R1, 8
-      BNEZ  R1, LOOP`;
+const DEFAULT_CODE = `L.D F6, 0(R2)
+L.D F2, 8(R2)
+MUL.D F0, F2, F4
+SUB.D F8, F2, F6
+DIV.D F10, F0, F6
+ADD.D F6, F8, F2
+S.D F6, 8(R2)`;
+
+// --- UTILS ---
+
+const parseInstruction = (line) => {
+  const cleanLine = line.trim().replace(/,/g, ' ').replace(/\s+/g, ' ');
+  if (!cleanLine || cleanLine.startsWith(";")) return null;
+  
+  const parts = cleanLine.split(':');
+  let label = null;
+  let instruction = parts[0].trim();
+  
+  if (parts.length > 1) {
+    label = parts[0].trim();
+    instruction = parts[1].trim();
+  }
+  
+  if (!instruction) return { type: 'LABEL', label };
+
+  const tokens = instruction.split(' ');
+  const op = tokens[0].toUpperCase();
+  
+  let type = 'ALU';
+  if (['L.D','L.S','LW','LD'].includes(op)) type = 'LOAD';
+  else if (['S.D','S.S','SW','SD'].includes(op)) type = 'STORE';
+  else if (['BNE','BEQ','BNEZ','BEQZ'].includes(op)) type = 'BRANCH';
+  
+  return { 
+    text: instruction, 
+    label, 
+    op, 
+    tokens: tokens.slice(1),
+    type 
+  };
+};
+
+const toBinary32 = (num) => {
+  // Handle conversion of number to 32-bit binary string
+  // Using unsigned right shift to coerce to 32-bit integer representation
+  return (num >>> 0).toString(2).padStart(32, '0');
+};
 
 // --- SIMULATOR LOGIC ---
 
 const generateInitialState = (config, codeText) => {
-  const lines = codeText.split("\n");
-  const instructions = lines
-    .map((l, i) => parseInstruction(l, i))
-    .filter((l) => l);
-
+  const lines = codeText.split('\n');
+  const instructions = [];
   const labels = {};
-  instructions.forEach((inst, idx) => {
-    if (inst.label) labels[inst.label] = idx;
+  
+  let pIdx = 0;
+  lines.forEach(line => {
+    const parsed = parseInstruction(line);
+    if (parsed) {
+      if (parsed.label) labels[parsed.label] = pIdx;
+      if (parsed.type !== 'LABEL') {
+        instructions.push({ ...parsed, id: pIdx });
+        pIdx++;
+      }
+    }
   });
 
+  // Init Registers (32 of each)
   const regs = {};
-  for (let i = 0; i < 32; i++) regs[`R${i}`] = { val: 0, qi: null };
-  for (let i = 0; i < 32; i++) regs[`F${i}`] = { val: 0.0, qi: null };
+  for(let i=0; i<32; i++) regs[`R${i}`] = { val: 0, qi: null };
+  for(let i=0; i<32; i++) regs[`F${i}`] = { val: 0.0, qi: null };
+  
+  // Default Register Values
+  regs['R1'].val = 16; 
+  regs['R2'].val = 0; 
+  regs['F2'].val = 2.5; 
 
-  // Pre-load specific values for the loop trace
-  regs["R1"].val = 32; // Loop starts at address 32, decrements by 8
-  regs["F2"].val = 0.5; // Multiplier
-
-  // Init Memory with some data at the target addresses
-  const memoryValues = {
-    32: 100.0,
-    24: 200.0,
-    16: 300.0,
-    8: 400.0,
+  // Pre-load Memory (0, 4, 8, 16)
+  const memory = {
+    0: 100,
+    4: 200,
+    8: 300,
+    16: 400
   };
 
+  const rs = {};
+  Object.keys(config.rsSize).forEach(type => {
+    rs[type] = Array.from({ length: config.rsSize[type] }, (_, i) => ({
+      id: `${type}${i+1}`,
+      type,
+      busy: false,
+      op: '',
+      vj: null, vk: null,
+      qj: null, qk: null,
+      address: null,
+      timer: 0,
+      state: 'IDLE',
+      instIdx: -1,
+      result: 0
+    }));
+  });
+
   const numBlocks = config.cache.size / config.cache.blockSize;
-  const cacheBlocks = Array.from({ length: numBlocks }, () => ({
+  const cache = Array.from({ length: numBlocks }, (_, i) => ({
+    index: i,
     valid: false,
     tag: null,
     data: null,
-    lastAccess: 0,
+    history: []
   }));
-
-  const rs = {};
-  Object.keys(config.rsSize).forEach((type) => {
-    rs[type] = Array.from({ length: config.rsSize[type] }, (_, i) => ({
-      id: `${type}${i + 1}`,
-      type,
-      busy: false,
-      op: "",
-      vj: null,
-      vk: null,
-      qj: null,
-      qk: null,
-      address: null,
-      timer: 0,
-      state: "IDLE",
-    }));
-  });
 
   return {
     clock: 0,
@@ -202,590 +154,510 @@ const generateInitialState = (config, codeText) => {
     config,
     rs,
     regs,
-    memoryValues,
-    cache: cacheBlocks,
-    log: ["Classic Tomasulo Initialized."],
-    branchStall: false,
+    memory,
+    cache,
+    instStatus: [],
+    iteration: 1,
+    branchStall: false
   };
 };
 
 const reducer = (state, action) => {
-  if (action.type === "RESET")
-    return generateInitialState(action.config, action.code);
-
-  if (action.type === "STEP") {
+  if (action.type === 'EXIT') return null;
+  if (action.type === 'RESET') return generateInitialState(action.config, action.code);
+  
+  if (action.type === 'STEP') {
     let next = JSON.parse(JSON.stringify(state));
     next.clock++;
-    const { config, rs, regs, cache } = next;
-    const log = [];
 
-    const addToLog = (msg) => log.unshift(`C${next.clock}: ${msg}`);
+    // 1. EXECUTE & WRITEBACK
+    const readyToBroadcast = [];
+    
+    Object.values(next.rs).flat().forEach(u => {
+      if (!u.busy) return;
 
-    // --- HELPER: CDB BROADCAST ---
-    const broadcast = (rsId, value) => {
-      // 1. Update Register File
-      Object.keys(next.regs).forEach((regName) => {
-        if (next.regs[regName].qi === rsId) {
-          next.regs[regName].val = value;
-          next.regs[regName].qi = null;
-        }
-      });
+      if (u.state === 'ISSUE' && u.qj === null && u.qk === null) {
+        u.state = 'EXEC';
+        if (u.type === 'LOAD') {
+           const addr = u.address;
+           const blockIdx = Math.floor(addr / next.config.cache.blockSize) % next.cache.length;
+           const tag = Math.floor(addr / next.config.cache.blockSize / next.cache.length);
+           const block = next.cache[blockIdx];
+           const isHit = block.valid && block.tag === tag;
 
-      // 2. Update Reservation Stations (Qj, Qk)
-      Object.values(next.rs)
-        .flat()
-        .forEach((unit) => {
-          if (unit.busy) {
-            if (unit.qj === rsId) {
-              unit.vj = value;
-              unit.qj = null;
-            }
-            if (unit.qk === rsId) {
-              unit.vk = value;
-              unit.qk = null;
-            }
-          }
-        });
-
-      addToLog(`${rsId} broadcast ${value}`);
-    };
-
-    // --- STAGE 1: EXECUTE & WRITE RESULT ---
-
-    Object.keys(rs).forEach((type) => {
-      rs[type].forEach((unit) => {
-        if (!unit.busy) return;
-
-        // Check Operands Readiness
-        const hasOperands = unit.qj === null && unit.qk === null;
-
-        if (unit.state === "IDLE" && hasOperands) {
-          unit.state = "EXECUTING";
-
-          if (type === "LOAD" || type === "STORE") {
-            // Address Calc: Base(Vj) + Offset(Address stored in Issue)
-            // Note: In Issue below, we store Imm in 'address' field initially.
-            unit.address = (unit.vj || 0) + (unit.address || 0);
-          }
-        }
-
-        if (unit.state === "EXECUTING") {
-          // Handle Cache Latency for Loads
-          if (type === "LOAD" && unit.timer === 0) {
-            const addr = unit.address;
-            const blockIdx =
-              Math.floor(addr / config.cache.blockSize) % cache.length;
-            const tag = Math.floor(addr / config.cache.blockSize);
-            const isHit = cache[blockIdx].valid && cache[blockIdx].tag === tag;
-
-            if (isHit) {
-              unit.timer = config.cache.hitLatency;
-              addToLog(`Cache HIT at ${addr}`);
-            } else {
-              unit.timer = config.cache.hitLatency + config.cache.missPenalty;
-              addToLog(`Cache MISS at ${addr}`);
-              cache[blockIdx] = { valid: true, tag, data: "Block" };
-            }
-          }
-
-          if (unit.timer > 0) unit.timer--;
-
-          if (unit.timer === 0) {
-            let result = 0;
-
-            // ALU Logic
-            if (type === "LOAD") result = next.memoryValues[unit.address] || 0;
-            else if (["ADD.D", "ADD.S", "ADDI", "DADDI"].includes(unit.op))
-              result = unit.vj + unit.vk;
-            else if (["SUB.D", "SUB.S", "SUBI", "DSUBI"].includes(unit.op))
-              result = unit.vj - unit.vk;
-            else if (["MUL.D", "MUL.S"].includes(unit.op))
-              result = unit.vj * unit.vk;
-            else if (["DIV.D", "DIV.S"].includes(unit.op))
-              result = unit.vj / unit.vk;
-            else if (BRANCH_OPS.includes(unit.op)) {
-              // Branch evaluation
-              if (unit.op === "BNE") result = unit.vj !== unit.vk ? 1 : 0;
-              if (unit.op === "BEQ") result = unit.vj === unit.vk ? 1 : 0;
-              if (unit.op === "BNEZ") result = unit.vj !== 0 ? 1 : 0; // Compare against 0
-            }
-
-            unit.computedResult = result;
-            unit.state = "WRITE";
-          }
-        }
-
-        // Write Result Stage
-        if (unit.state === "WRITE") {
-          if (type === "STORE") {
-            // Store Buffer waits for Value (Vk/Qk)
-            if (unit.qk === null) {
-              const addr = unit.address;
-              const val = unit.vk;
-              next.memoryValues[addr] = val;
-              addToLog(`Store ${val} to Mem[${addr}]`);
-
-              const blockIdx =
-                Math.floor(addr / config.cache.blockSize) % cache.length;
-              const tag = Math.floor(addr / config.cache.blockSize);
-              if (cache[blockIdx].valid && cache[blockIdx].tag === tag)
-                cache[blockIdx].valid = false;
-
-              unit.busy = false;
-              unit.state = "IDLE";
-            }
-          } else if (BRANCH_OPS.includes(unit.op)) {
-            // Branch Resolution
-            const taken = unit.computedResult === 1;
-            if (taken) {
-              // Unit Address holds Label Name (string) from Issue
-              if (next.labels[unit.address] !== undefined) {
-                next.pc = next.labels[unit.address];
-                addToLog(`Branch Taken -> Jump to ${unit.address}`);
-              } else {
-                addToLog(`Branch Error: Label ${unit.address} not found`);
-              }
-            } else {
-              addToLog(`Branch Not Taken -> Continue`);
-            }
-
-            next.branchStall = false; // Unstall Fetch
-            unit.busy = false;
-            unit.state = "IDLE";
-          } else {
-            broadcast(unit.id, unit.computedResult);
-            unit.busy = false;
-            unit.state = "IDLE";
-          }
-        }
-      });
-    });
-
-    // --- STAGE 2: ISSUE ---
-    if (!next.branchStall && next.pc < next.instructions.length) {
-      const inst = next.instructions[next.pc];
-
-      if (inst.type === "LABEL") {
-        next.pc++;
-      } else {
-        let type = "";
-        if (LOAD_OPS.includes(inst.op)) type = "LOAD";
-        else if (STORE_OPS.includes(inst.op)) type = "STORE";
-        else if (["MUL.D", "DIV.D", "MUL.S", "DIV.S"].includes(inst.op))
-          type = "MULT";
-        else type = "ADD";
-
-        const freeIdx = next.rs[type].findIndex((u) => !u.busy);
-
-        if (freeIdx !== -1) {
-          const rsUnit = next.rs[type][freeIdx];
-          rsUnit.busy = true;
-          rsUnit.op = inst.op;
-          rsUnit.timer = config.latencies[inst.op] || 1;
-          rsUnit.state = "IDLE";
-
-          const getReg = (regName) => {
-            if (!isNaN(regName)) return { val: parseFloat(regName), qi: null };
-            const r = next.regs[regName];
-            return { val: r.val, qi: r.qi };
-          };
-
-          if (type === "LOAD") {
-            const base = getReg(inst.rs);
-            rsUnit.vj = base.val;
-            rsUnit.qj = base.qi;
-            rsUnit.address = inst.imm;
-            rsUnit.vk = null;
-            rsUnit.qk = null;
-            if (inst.dest) next.regs[inst.dest].qi = rsUnit.id;
-          } else if (type === "STORE") {
-            const base = getReg(inst.rs);
-            rsUnit.vj = base.val;
-            rsUnit.qj = base.qi;
-            const src = getReg(inst.dest);
-            rsUnit.vk = src.val;
-            rsUnit.qk = src.qi;
-            rsUnit.address = inst.imm;
-          } else if (BRANCH_OPS.includes(inst.op)) {
-            const src1 = getReg(inst.rs);
-            rsUnit.vj = src1.val;
-            rsUnit.qj = src1.qi;
-
-            // Check if 2 operand branch (BNE) or 1 (BNEZ)
-            if (inst.rt) {
-              const src2 = getReg(inst.rt);
-              rsUnit.vk = src2.val;
-              rsUnit.qk = src2.qi;
-            } else {
-              rsUnit.vk = 0;
-              rsUnit.qk = null; // Compare vs 0
-            }
-
-            rsUnit.address = inst.target; // Store Target Label
-            next.branchStall = true; // Stall Fetch
-          } else {
-            const src1 = getReg(inst.src1);
-            const src2 = getReg(inst.src2);
-            rsUnit.vj = src1.val;
-            rsUnit.qj = src1.qi;
-            rsUnit.vk = src2.val;
-            rsUnit.qk = src2.qi;
-            if (inst.dest) next.regs[inst.dest].qi = rsUnit.id;
-          }
-
-          next.pc++;
-          addToLog(`Issued ${inst.text} to ${rsUnit.id}`);
-        } else {
-          addToLog(`Stall: No RS for ${inst.op}`);
+           if (isHit) {
+             u.timer = next.config.cache.hitLatency;
+             block.history.push(`Hit C${next.clock}`);
+           } else {
+             u.timer = next.config.cache.hitLatency + next.config.cache.missPenalty;
+             next.cache[blockIdx] = { 
+                ...block, valid: true, tag, data: `Mem[${Math.floor(addr/8)*8}]`,
+                history: [...block.history, `Miss C${next.clock}`]
+             };
+           }
         }
       }
+
+      if (u.state === 'EXEC') {
+        if (u.timer > 0) u.timer--;
+        if (u.timer === 0) {
+          next.instStatus[u.instIdx].execComp = next.clock;
+          if (u.type === 'STORE') {
+             if (u.qk === null) readyToBroadcast.push(u); 
+          } else {
+             readyToBroadcast.push(u);
+             if (u.type === 'LOAD') u.result = next.memory[u.address] || (100 + u.address);
+             else if (['ADD.D','ADDI','DADDI'].includes(u.op)) u.result = parseFloat(u.vj) + parseFloat(u.vk);
+             else if (['SUB.D','SUBI','DSUBI'].includes(u.op)) u.result = parseFloat(u.vj) - parseFloat(u.vk);
+             else if (u.op === 'MUL.D') u.result = parseFloat(u.vj) * parseFloat(u.vk);
+             else if (u.op === 'DIV.D') u.result = parseFloat(u.vj) / parseFloat(u.vk);
+             else if (u.type === 'BRANCH') {
+                 if (u.op === 'BNE') u.result = (u.vj !== u.vk);
+                 if (u.op === 'BEQ') u.result = (u.vj === u.vk);
+                 if (u.op === 'BNEZ') u.result = (u.vj !== 0);
+             }
+          }
+        }
+      }
+    });
+
+    if (readyToBroadcast.length > 0) {
+      readyToBroadcast.sort((a,b) => {
+        const priority = { 'BRANCH':0, 'STORE':1, 'LOAD':2, 'MULT':3, 'ADD':4 };
+        return priority[a.type] - priority[b.type];
+      });
+      const winner = readyToBroadcast[0];
+      next.instStatus[winner.instIdx].writeRes = next.clock;
+
+      if (winner.type === 'STORE') {
+        next.memory[winner.address] = winner.vk;
+      } else if (winner.type === 'BRANCH') {
+         if (winner.result && next.labels[winner.address] !== undefined) {
+             next.pc = next.labels[winner.address];
+             next.iteration++; 
+         }
+         next.branchStall = false;
+      } else {
+         Object.values(next.regs).forEach(r => {
+           if (r.qi === winner.id) { r.val = winner.result; r.qi = null; }
+         });
+         Object.values(next.rs).flat().forEach(rs => {
+           if (rs.qj === winner.id) { rs.vj = winner.result; rs.qj = null; }
+           if (rs.qk === winner.id) { rs.vk = winner.result; rs.qk = null; }
+         });
+      }
+      const rsRef = next.rs[winner.type].find(r => r.id === winner.id);
+      rsRef.busy = false; rsRef.state = 'IDLE';
     }
 
-    next.log = [...log, ...next.log].slice(0, 50);
+    // 2. ISSUE
+    if (!next.branchStall && next.pc < next.instructions.length) {
+      const inst = next.instructions[next.pc];
+      let rsType = 'ADD';
+      if (['MUL.D','DIV.D'].includes(inst.op)) rsType = 'MULT';
+      else if (inst.type === 'LOAD') rsType = 'LOAD';
+      else if (inst.type === 'STORE') rsType = 'STORE';
+      
+      const freeUnit = next.rs[rsType].find(u => !u.busy);
+
+      if (freeUnit) {
+        freeUnit.busy = true; freeUnit.op = inst.op;
+        freeUnit.timer = next.config.latencies[inst.op] || 1;
+        freeUnit.state = 'ISSUE';
+        
+        const statusEntry = {
+          id: next.instStatus.length, iter: next.iteration, text: inst.text,
+          j: '', k: '', issue: next.clock, execComp: '', writeRes: ''
+        };
+        freeUnit.instIdx = statusEntry.id;
+        
+        const getReg = (rName) => {
+             if (rName.match(/^[RF]\d+$/)) return next.regs[rName];
+             return { val: parseInt(rName)||0, qi: null }; 
+        };
+
+        if (inst.type === 'LOAD') {
+           const [dest, offsetStr] = inst.tokens;
+           const match = offsetStr.match(/(-?\d+)\(([A-Z0-9]+)\)/);
+           const offset = parseInt(match?.[1] || offsetStr);
+           const baseReg = match?.[2] || 'R0';
+           const rBase = getReg(baseReg);
+           if (rBase.qi) { freeUnit.qj = rBase.qi; statusEntry.j = rBase.qi; }
+           else { freeUnit.vj = rBase.val; statusEntry.j = rBase.val; }
+           if (freeUnit.qj === null) freeUnit.address = offset + freeUnit.vj;
+           next.regs[dest].qi = freeUnit.id;
+        } else if (inst.type === 'STORE') {
+           const [src, offsetStr] = inst.tokens;
+           const rSrc = getReg(src);
+           const match = offsetStr.match(/(-?\d+)\(([A-Z0-9]+)\)/);
+           const offset = parseInt(match?.[1] || offsetStr);
+           const baseReg = match?.[2] || 'R0';
+           const rBase = getReg(baseReg);
+           if (rBase.qi) { freeUnit.qj = rBase.qi; statusEntry.j = rBase.qi; }
+           else { freeUnit.vj = rBase.val; statusEntry.j = rBase.val; }
+           if (rSrc.qi) { freeUnit.qk = rSrc.qi; statusEntry.k = rSrc.qi; }
+           else { freeUnit.vk = rSrc.val; statusEntry.k = rSrc.val; }
+           freeUnit.address = offset; 
+           if (freeUnit.qj === null) freeUnit.address += freeUnit.vj;
+        } else if (inst.type === 'BRANCH') {
+            const [Op1, Op2, Label] = inst.tokens;
+            const r1 = getReg(Op1);
+            if (r1.qi) { freeUnit.qj = r1.qi; statusEntry.j = r1.qi; }
+            else { freeUnit.vj = r1.val; statusEntry.j = r1.val; }
+            if (inst.op !== 'BNEZ' && inst.op !== 'BEQZ') {
+               const r2 = getReg(Op2);
+               if (r2.qi) { freeUnit.qk = r2.qi; statusEntry.k = r2.qi; }
+               else { freeUnit.vk = r2.val; statusEntry.k = r2.val; }
+               freeUnit.address = Label; 
+            } else {
+               freeUnit.vk = 0; statusEntry.k = 0; freeUnit.address = Op2;
+            }
+            next.branchStall = true;
+        } else {
+            const [dest, s1, s2] = inst.tokens;
+            const r1 = getReg(s1);
+            const r2 = getReg(s2);
+            if (r1.qi) { freeUnit.qj = r1.qi; statusEntry.j = r1.qi; }
+            else { freeUnit.vj = r1.val; statusEntry.j = r1.val; }
+            if (r2.qi) { freeUnit.qk = r2.qi; statusEntry.k = r2.qi; }
+            else { freeUnit.vk = r2.val; statusEntry.k = r2.val; }
+            next.regs[dest].qi = freeUnit.id;
+        }
+        next.instStatus.push(statusEntry);
+        next.pc++;
+      }
+    }
     return next;
   }
   return state;
 };
 
-// --- UI COMPONENTS ---
+// --- COMPONENTS ---
 
-const Section = ({ title, children, icon: Icon, className = "" }) => (
-  <div
-    className={`bg-gray-800 rounded-xl overflow-hidden shadow-lg border border-gray-700 flex flex-col ${className}`}
-  >
-    <div className="bg-gray-700/50 px-3 py-2 border-b border-gray-700 flex items-center gap-2">
-      {Icon && <Icon size={14} className="text-blue-400" />}
-      <h3 className="font-semibold text-gray-200 text-xs tracking-wider uppercase">
-        {title}
-      </h3>
-    </div>
-    <div className="p-2 overflow-auto flex-1 custom-scrollbar">{children}</div>
+const StatusTable = ({ data }) => (
+  <div className="overflow-auto max-h-60 bg-gray-900 rounded-lg border border-gray-700 shadow-lg custom-scrollbar">
+    <table className="w-full text-xs text-left border-collapse">
+      <thead className="bg-gray-800 text-gray-200 sticky top-0 border-b border-gray-700">
+        <tr>
+          <th className="p-3">Iter</th>
+          <th className="p-3">Instruction</th>
+          <th className="p-3 w-12">j</th>
+          <th className="p-3 w-12">k</th>
+          <th className="p-3">Issue</th>
+          <th className="p-3">Exec Comp</th>
+          <th className="p-3">Write Res</th>
+        </tr>
+      </thead>
+      <tbody className="divide-y divide-gray-800 text-gray-300">
+        {data.map((row) => (
+          <tr key={row.id} className="odd:bg-gray-900 even:bg-gray-800/50 hover:bg-gray-700/50 transition-colors">
+            <td className="p-3 text-gray-500">{row.iter}</td>
+            <td className="p-3 font-mono text-blue-400 font-bold">{row.text}</td>
+            <td className="p-3 text-gray-400">{row.j}</td>
+            <td className="p-3 text-gray-400">{row.k}</td>
+            <td className="p-3 text-center">{row.issue}</td>
+            <td className="p-3 text-center">{row.execComp}</td>
+            <td className="p-3 text-center text-green-400 font-bold">{row.writeRes}</td>
+          </tr>
+        ))}
+        {data.length === 0 && <tr><td colSpan="7" className="p-6 text-center text-gray-600">No instructions issued yet.</td></tr>}
+      </tbody>
+    </table>
   </div>
 );
 
-const RSTable = ({ stations, type }) => (
-  <table className="w-full text-xs text-left border-collapse">
-    <thead className="bg-gray-900/50 text-gray-500">
-      <tr>
-        <th className="p-1">ID</th>
-        <th className="p-1">Busy</th>
-        <th className="p-1">Op</th>
-        <th className="p-1">Vj</th>
-        <th className="p-1">Vk</th>
-        <th className="p-1">Qj</th>
-        <th className="p-1">Qk</th>
-        {type === "LOAD" || type === "STORE" ? (
-          <th className="p-1">Addr</th>
-        ) : null}
-        <th className="p-1">Time</th>
-      </tr>
-    </thead>
-    <tbody className="divide-y divide-gray-800">
-      {stations.map((u) => (
-        <tr key={u.id} className={u.busy ? "bg-gray-800/80" : "opacity-30"}>
-          <td className="p-1 font-medium text-blue-300">{u.id}</td>
-          <td className="p-1 text-gray-400">{u.busy ? "Yes" : "No"}</td>
-          <td className="p-1 text-white">{u.busy ? u.op : ""}</td>
-          <td className="p-1 font-mono text-gray-400">
-            {u.busy && u.vj !== null ? u.vj : ""}
-          </td>
-          <td className="p-1 font-mono text-gray-400">
-            {u.busy && u.vk !== null ? u.vk : ""}
-          </td>
-          <td className="p-1 text-yellow-500">{u.busy ? u.qj : ""}</td>
-          <td className="p-1 text-yellow-500">{u.busy ? u.qk : ""}</td>
-          {type === "LOAD" || type === "STORE" ? (
-            <td className="p-1 text-orange-300">
-              {u.busy
-                ? typeof u.address === "number"
-                  ? u.address
-                  : u.busy
-                  ? "Calc"
-                  : ""
-                : ""}
-            </td>
-          ) : null}
-          <td className="p-1 font-bold text-green-400">
-            {u.busy && u.timer > 0 ? u.timer : ""}
-          </td>
-        </tr>
-      ))}
-    </tbody>
-  </table>
-);
-
-const RegisterFile = ({ regs }) => (
-  <div className="grid grid-cols-4 gap-1">
-    {Object.keys(regs).map((k) => (
-      <div
-        key={k}
-        className={`p-1 rounded text-[10px] border ${
-          regs[k].qi
-            ? "border-yellow-600 bg-yellow-900/20"
-            : "border-gray-700 bg-gray-800"
-        }`}
-      >
-        <div className="flex justify-between">
-          <span className="font-bold text-gray-400">{k}</span>
-          {regs[k].qi && <span className="text-yellow-400">{regs[k].qi}</span>}
-        </div>
-        <div className="truncate text-gray-200">{regs[k].val}</div>
+const CacheView = ({ cache }) => (
+  <div className="grid grid-cols-8 gap-2">
+    {cache.map((block) => (
+      <div key={block.index} className={`rounded p-2 text-[10px] flex flex-col items-center border transition-all ${
+        block.valid 
+        ? 'bg-green-900/20 border-green-700/50 text-green-100' 
+        : 'bg-gray-800 border-gray-700 text-gray-500'
+      }`}>
+        <div className="font-bold mb-1 opacity-50">Idx: {block.index}</div>
+        {block.valid ? (
+          <>
+            <div className="text-green-400 font-bold">Tag: {block.tag}</div>
+            <div className="text-xs truncate w-full text-center bg-gray-900/50 rounded mt-1 px-1 py-0.5" title={block.data}>{block.data}</div>
+            <div className="mt-1 text-green-500/50 text-[9px]">{block.history.length} Accesses</div>
+          </>
+        ) : (
+          <div className="italic py-2 opacity-30">Invalid</div>
+        )}
       </div>
     ))}
   </div>
 );
 
-const ConfigScreen = ({ onStart }) => {
-  const [config, setConfig] = useState(DEFAULT_CONFIG);
-  const updateVal = (path, val) => {
-    const keys = path.split(".");
-    setConfig((prev) => {
-      const next = JSON.parse(JSON.stringify(prev));
-      let ref = next;
-      for (let i = 0; i < keys.length - 1; i++) ref = ref[keys[i]];
-      ref[keys[keys.length - 1]] = parseInt(val);
-      return next;
-    });
+const ConfigScreen = ({ onStart, initialConfig, initialCode }) => {
+  const [config, setConfig] = useState(initialConfig || DEFAULT_CONFIG);
+  const [code, setCode] = useState(initialCode || DEFAULT_CODE);
+
+  const update = (path, val) => {
+    const c = JSON.parse(JSON.stringify(config));
+    let ref = c;
+    const parts = path.split('.');
+    while(parts.length > 1) ref = ref[parts.shift()];
+    ref[parts[0]] = parseInt(val);
+    setConfig(c);
   };
+
   return (
-    <div className="p-8 max-w-2xl mx-auto bg-gray-900 text-gray-100 rounded-xl mt-10 shadow-2xl">
-      <h1 className="text-2xl font-bold mb-6 text-blue-400">
-        Classic Tomasulo Config
-      </h1>
-      <div className="space-y-6">
-        <div>
-          <h3 className="font-bold text-gray-400 mb-2 uppercase text-xs">
-            Buffer Sizes
-          </h3>
-          <div className="grid grid-cols-4 gap-4">
-            {["ADD", "MULT", "LOAD", "STORE"].map((t) => (
-              <label key={t} className="text-xs">
-                {t} Stations
-                <input
-                  type="number"
-                  value={config.rsSize[t]}
-                  onChange={(e) => updateVal(`rsSize.${t}`, e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded p-1 mt-1"
-                />
-              </label>
-            ))}
-          </div>
+    <div className="min-h-screen bg-gray-950 p-8 font-sans text-gray-200">
+      <div className="max-w-5xl mx-auto bg-gray-900 rounded-xl shadow-2xl border border-gray-800 overflow-hidden">
+        <div className="bg-gray-800 p-6 flex justify-between items-center border-b border-gray-700">
+            <div>
+                <h1 className="text-2xl font-bold text-blue-400">CSEN 702: Tomasulo Simulator</h1>
+                <p className="text-gray-400 text-sm">Configure your architecture environment</p>
+            </div>
+            <Cpu size={40} className="text-blue-500 opacity-80" />
         </div>
-        <div>
-          <h3 className="font-bold text-gray-400 mb-2 uppercase text-xs">
-            Latencies
-          </h3>
-          <div className="grid grid-cols-4 gap-4">
-            <label className="text-xs">
-              Add/Sub
-              <input
-                type="number"
-                defaultValue={2}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
-                onChange={(e) => {
-                  const v = parseInt(e.target.value);
-                  setConfig((p) => {
-                    const n = { ...p };
-                    ["ADD.D", "SUB.D", "ADDI"].forEach(
-                      (k) => (n.latencies[k] = v)
-                    );
-                    return n;
-                  });
-                }}
-              />
-            </label>
-            <label className="text-xs">
-              Mult
-              <input
-                type="number"
-                value={config.latencies["MUL.D"]}
-                onChange={(e) => updateVal(`latencies.MUL.D`, e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
-              />
-            </label>
-            <label className="text-xs">
-              Div
-              <input
-                type="number"
-                value={config.latencies["DIV.D"]}
-                onChange={(e) => updateVal(`latencies.DIV.D`, e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
-              />
-            </label>
-            <label className="text-xs">
-              Load/Store
-              <input
-                type="number"
-                value={config.latencies["L.D"]}
-                onChange={(e) => updateVal(`latencies.L.D`, e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded p-1"
-              />
-            </label>
-          </div>
+        
+        <div className="p-6 grid grid-cols-2 gap-8">
+            {/* Left: Code */}
+            <div>
+                <h3 className="font-bold text-gray-300 mb-3 flex items-center gap-2 text-sm uppercase tracking-wider">
+                  <Terminal size={16} className="text-blue-400"/> Assembly Code
+                </h3>
+                <textarea 
+                    className="w-full h-96 p-4 font-mono text-sm bg-gray-950 text-green-400 rounded-lg border border-gray-700 focus:ring-2 ring-blue-500/50 outline-none resize-none"
+                    value={code}
+                    onChange={(e) => setCode(e.target.value)}
+                    spellCheck="false"
+                />
+                <div className="mt-3 text-xs text-gray-500">Supported: L.D, S.D, ADD.D, MUL.D, DIV.D, BNE, DADDI, etc.</div>
+            </div>
+
+            {/* Right: Settings */}
+            <div className="space-y-6 overflow-y-auto h-96 pr-2 custom-scrollbar">
+                
+                {/* Latencies */}
+                <div className="bg-gray-800/50 p-4 rounded-lg border border-gray-700">
+                    <h4 className="font-bold text-gray-400 text-xs mb-3 uppercase border-b border-gray-700 pb-2">Latencies (Cycles)</h4>
+                    <div className="grid grid-cols-3 gap-3">
+                        {['ADD.D','MUL.D','DIV.D','L.D','S.D'].map(op => (
+                            <label key={op} className="text-xs font-semibold text-gray-500 block">
+                                {op}
+                                <input type="number" value={config.latencies[op]} 
+                                    onChange={(e)=>update(`latencies.${op}`, e.target.value)}
+                                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none" />
+                            </label>
+                        ))}
+                    </div>
+                </div>
+
+                {/* RS Sizes */}
+                <div className="bg-gray-800/50 p-4 rounded-lg border border-gray-700">
+                    <h4 className="font-bold text-gray-400 text-xs mb-3 uppercase border-b border-gray-700 pb-2">Buffer Sizes</h4>
+                    <div className="grid grid-cols-4 gap-3">
+                        {['ADD','MULT','LOAD','STORE'].map(type => (
+                            <label key={type} className="text-xs font-semibold text-gray-500 block">
+                                {type}
+                                <input type="number" value={config.rsSize[type]} 
+                                    onChange={(e)=>update(`rsSize.${type}`, e.target.value)}
+                                    className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none" />
+                            </label>
+                        ))}
+                    </div>
+                </div>
+
+                {/* Cache Config */}
+                <div className="bg-blue-900/10 p-4 rounded-lg border border-blue-900/30">
+                    <h4 className="font-bold text-blue-400 text-xs mb-3 uppercase border-b border-blue-900/30 pb-2 flex items-center gap-2">
+                        <MemoryStick size={14}/> Cache Config
+                    </h4>
+                    <div className="grid grid-cols-2 gap-3">
+                        <label className="text-xs font-semibold text-gray-500 block">
+                            Size (Bytes)
+                            <input type="number" value={config.cache.size} 
+                                onChange={(e)=>update(`cache.size`, e.target.value)}
+                                className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none" />
+                        </label>
+                        <label className="text-xs font-semibold text-gray-500 block">
+                            Block Size (Bytes)
+                            <input type="number" value={config.cache.blockSize} 
+                                onChange={(e)=>update(`cache.blockSize`, e.target.value)}
+                                className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none" />
+                        </label>
+                        <label className="text-xs font-semibold text-gray-500 block">
+                            Hit Time
+                            <input type="number" value={config.cache.hitLatency} 
+                                onChange={(e)=>update(`cache.hitLatency`, e.target.value)}
+                                className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none" />
+                        </label>
+                        <label className="text-xs font-semibold text-gray-500 block">
+                            Miss Penalty
+                            <input type="number" value={config.cache.missPenalty} 
+                                onChange={(e)=>update(`cache.missPenalty`, e.target.value)}
+                                className="w-full mt-1 bg-gray-900 border border-gray-700 rounded p-2 text-gray-200 focus:border-blue-500 outline-none" />
+                        </label>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+        <div className="p-6 bg-gray-800 border-t border-gray-700 flex justify-end">
+            <button onClick={() => onStart(config, code)} className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-lg font-bold shadow-lg flex items-center gap-2 transition-colors">
+                Launch Simulator <ArrowRight size={18} />
+            </button>
         </div>
       </div>
-      <button
-        onClick={() => onStart(config)}
-        className="mt-8 w-full py-3 bg-blue-600 hover:bg-blue-500 rounded font-bold"
-      >
-        Initialize
-      </button>
     </div>
   );
 };
 
-export default function TomasuloSimulator() {
+export default function TomasuloApp() {
   const [config, setConfig] = useState(null);
   const [code, setCode] = useState(DEFAULT_CODE);
   const [state, dispatch] = useReducer(reducer, null);
-  const [activeTab, setActiveTab] = useState("FP");
 
-  if (!config || !state)
-    return (
-      <ConfigScreen
-        onStart={(c) => {
-          setConfig(c);
-          dispatch({ type: "RESET", config: c, code });
-        }}
-      />
-    );
+  if (!state) return (
+    <ConfigScreen 
+        initialConfig={config} 
+        initialCode={code} 
+        onStart={(c, cd) => { 
+            setConfig(c); 
+            setCode(cd); 
+            dispatch({type:'RESET', config: c, code: cd}); 
+        }} 
+    />
+  );
 
   return (
-    <div className="h-screen bg-gray-950 text-gray-100 flex flex-col font-sans text-xs">
-      {/* HEADER */}
-      <div className="bg-gray-900 border-b border-gray-800 p-2 flex justify-between items-center">
+    <div className="h-screen flex flex-col bg-gray-950 text-gray-300 font-sans text-xs overflow-hidden">
+      {/* Header */}
+      <div className="bg-gray-900 border-b border-gray-800 px-4 py-2 flex justify-between items-center shadow-lg z-10">
         <div className="flex items-center gap-4">
-          <h1 className="font-bold text-lg text-blue-400 ml-2">
-            Classic Tomasulo
-          </h1>
-          <div className="flex gap-2">
-            <button
-              onClick={() => dispatch({ type: "STEP" })}
-              className="bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded font-bold flex items-center gap-2"
-            >
-              <SkipForward size={14} /> Step
+            <div className="bg-blue-900/50 text-blue-200 px-3 py-1 rounded border border-blue-800 font-bold flex items-center gap-2">
+              <Play size={12} className="fill-current"/> Cycle {state.clock}
+            </div>
+            <div className="h-6 w-px bg-gray-800"></div>
+            <button onClick={() => dispatch({type:'STEP'})} className="flex items-center gap-1 bg-green-700 hover:bg-green-600 text-white px-4 py-1.5 rounded shadow transition-colors font-bold">
+                <SkipForward size={14}/> Step
             </button>
-            <button
-              onClick={() => dispatch({ type: "RESET", config, code })}
-              className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded flex items-center gap-2"
-            >
-              <RotateCcw size={14} /> Reset
+            <button onClick={() => dispatch({type:'RESET', config, code})} className="flex items-center gap-1 bg-gray-800 hover:bg-gray-700 text-gray-300 px-4 py-1.5 rounded shadow border border-gray-700 transition-colors">
+                <RotateCcw size={14}/> Reset
             </button>
-            <button
-              onClick={() => setConfig(null)}
-              className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded flex items-center gap-2"
-            >
-              <Settings size={14} /> Config
+            <button onClick={() => dispatch({type:'EXIT'})} className="flex items-center gap-1 bg-gray-800 hover:bg-gray-700 text-gray-300 px-4 py-1.5 rounded shadow border border-gray-700 transition-colors">
+                <Settings size={14}/> Config
             </button>
-          </div>
         </div>
-        <div className="mr-4 text-xl font-mono font-bold">
-          Cycle: {state.clock}
-        </div>
+        <div className="text-gray-500 font-mono">PC: {state.pc}</div>
       </div>
 
-      {/* BODY */}
-      <div className="flex-1 flex overflow-hidden p-2 gap-2">
-        {/* COL 1: Code & Regs */}
-        <div className="flex flex-col gap-2 w-1/4 min-w-[250px]">
-          <Section title="Instruction Queue" icon={Layers} className="flex-[2]">
-            {state.instructions.map((inst, i) => (
-              <div
-                key={i}
-                className={`flex px-1 ${
-                  i === state.pc
-                    ? "bg-blue-900/50 text-white border border-blue-500"
-                    : "text-gray-500"
-                }`}
-              >
-                <span className="w-6">{i}</span>
-                <span>{inst.text}</span>
-                {i === state.pc && (
-                  <span className="ml-auto text-blue-300 font-bold">
-                    <GitBranch size={10} />
-                  </span>
-                )}
-              </div>
-            ))}
-          </Section>
-          <Section title="Register File" icon={Database} className="flex-[3]">
-            <div className="flex gap-2 mb-2">
-              <button
-                onClick={() => setActiveTab("FP")}
-                className={`px-2 py-1 rounded ${
-                  activeTab === "FP" ? "bg-blue-600" : "bg-gray-800"
-                }`}
-              >
-                FP
-              </button>
-              <button
-                onClick={() => setActiveTab("R")}
-                className={`px-2 py-1 rounded ${
-                  activeTab === "R" ? "bg-blue-600" : "bg-gray-800"
-                }`}
-              >
-                INT
-              </button>
-            </div>
-            <RegisterFile
-              regs={Object.fromEntries(
-                Object.entries(state.regs).filter(([k]) =>
-                  k.startsWith(activeTab === "FP" ? "F" : "R")
-                )
-              )}
-            />
-          </Section>
+      <div className="flex-1 flex overflow-hidden">
+        
+        {/* LEFT COLUMN: STATUS & CACHE */}
+        <div className="flex-[3] flex flex-col p-2 gap-2 overflow-y-auto custom-scrollbar">
+             {/* Instruction Status */}
+             <div className="bg-gray-900 p-3 rounded-lg shadow border border-gray-800">
+                <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
+                  <Layers size={14}/> Instruction Status
+                </h3>
+                <StatusTable data={state.instStatus} />
+             </div>
+
+             {/* RS Tables */}
+             <div className="grid grid-cols-2 gap-2">
+                {['ADD', 'MULT', 'LOAD', 'STORE'].map(type => (
+                    <div key={type} className="bg-gray-900 p-2 rounded-lg shadow border border-gray-800">
+                        <h4 className="font-bold text-gray-500 mb-2 text-[10px] uppercase tracking-wider pl-1">{type} Buffer</h4>
+                        <table className="w-full text-[10px] text-left">
+                            <thead className="bg-gray-800 text-gray-400">
+                                <tr>
+                                    <th className="p-1.5 rounded-l">ID</th>
+                                    <th className="p-1.5">Busy</th>
+                                    <th className="p-1.5">Op</th>
+                                    <th className="p-1.5">Vj</th>
+                                    <th className="p-1.5">Vk</th>
+                                    <th className="p-1.5">Qj</th>
+                                    <th className="p-1.5">Qk</th>
+                                    <th className="p-1.5 rounded-r">Time</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-800">
+                                {state.rs[type].map(u => (
+                                    <tr key={u.id} className={`${u.busy ? "bg-blue-900/20 text-blue-100" : "text-gray-600"}`}>
+                                        <td className={`p-1.5 font-bold ${u.busy ? 'text-blue-400' : 'text-gray-700'}`}>{u.id}</td>
+                                        <td className="p-1.5">{u.busy ? "Yes" : "No"}</td>
+                                        <td className="p-1.5 font-mono">{u.op}</td>
+                                        <td className="p-1.5 text-gray-400">{u.vj !== null ? u.vj : ""}</td>
+                                        <td className="p-1.5 text-gray-400">{u.vk !== null ? u.vk : ""}</td>
+                                        <td className="p-1.5 text-orange-400 font-bold">{u.qj}</td>
+                                        <td className="p-1.5 text-orange-400 font-bold">{u.qk}</td>
+                                        <td className="p-1.5 font-bold text-green-400">{u.busy ? u.timer : ""}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                ))}
+             </div>
+
+             {/* Cache Viz */}
+             <div className="bg-gray-900 p-3 rounded-lg shadow border border-gray-800">
+                 <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
+                   <MemoryStick size={14}/> Data Cache (Direct Mapped)
+                 </h3>
+                 <CacheView cache={state.cache} />
+             </div>
         </div>
 
-        {/* COL 2: Reservation Stations */}
-        <div className="flex flex-col gap-2 w-2/4 min-w-[400px]">
-          <Section
-            title="Adder RS (Add/Sub/Branch)"
-            icon={Cpu}
-            className="flex-1"
-          >
-            <RSTable stations={state.rs.ADD} type="ADD" />
-          </Section>
-          <Section
-            title="Multiplier RS (Mult/Div)"
-            icon={Cpu}
-            className="flex-1"
-          >
-            <RSTable stations={state.rs.MULT} type="MULT" />
-          </Section>
-          <Section title="Load Buffers" icon={MemoryStick} className="flex-1">
-            <RSTable stations={state.rs.LOAD} type="LOAD" />
-          </Section>
-          <Section title="Store Buffers" icon={Archive} className="flex-1">
-            <RSTable stations={state.rs.STORE} type="STORE" />
-          </Section>
+        {/* RIGHT COLUMN: REGISTERS & MEMORY */}
+        <div className="flex-1 min-w-[300px] bg-gray-900 border-l border-gray-800 p-2 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
+            <div className="bg-gray-800/50 p-2 rounded border border-gray-700 max-h-60 overflow-y-auto">
+                <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider sticky top-0 bg-gray-800/90 p-1">
+                  <Database size={14}/> Registers (FP)
+                </h3>
+                <div className="grid grid-cols-2 gap-1">
+                    {Object.entries(state.regs).filter(([k])=>k.startsWith('F')).map(([k,v]) => (
+                        <div key={k} className={`flex justify-between p-1.5 rounded border text-[10px] ${
+                          v.qi ? 'bg-orange-900/30 border-orange-800/50' : 'bg-gray-900 border-gray-700'
+                        }`}>
+                            <span className="font-bold text-gray-500">{k}</span>
+                            <span className={v.qi ? "text-orange-400 font-bold" : "text-blue-400"}>{v.qi || v.val.toFixed(1)}</span>
+                        </div>
+                    ))}
+                </div>
+            </div>
+            
+             <div className="bg-gray-800/50 p-2 rounded border border-gray-700 max-h-60 overflow-y-auto">
+                <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider sticky top-0 bg-gray-800/90 p-1">
+                  <Cpu size={14}/> Registers (Int)
+                </h3>
+                <div className="grid grid-cols-2 gap-1">
+                    {Object.entries(state.regs).filter(([k])=>k.startsWith('R')).map(([k,v]) => (
+                        <div key={k} className={`flex justify-between p-1.5 rounded border text-[10px] ${
+                          v.qi ? 'bg-orange-900/30 border-orange-800/50' : 'bg-gray-900 border-gray-700'
+                        }`}>
+                            <span className="font-bold text-gray-500">{k}</span>
+                            <span className={v.qi ? "text-orange-400 font-bold" : "text-blue-400"}>{v.qi || v.val}</span>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            <div className="bg-gray-800/50 p-2 rounded border border-gray-700 flex-1">
+                <h3 className="font-bold text-gray-400 mb-2 flex items-center gap-2 text-[10px] uppercase tracking-wider">
+                  <Save size={14}/> Memory
+                </h3>
+                <div className="space-y-1 font-mono text-[10px]">
+                    {Object.entries(state.memory).length === 0 ? <div className="text-gray-600 italic p-2 text-center">Memory Empty</div> :
+                     Object.entries(state.memory).map(([addr, val]) => (
+                        <div key={addr} className="flex flex-col border-b border-gray-700 py-2 px-1 gap-1">
+                            <div className="flex justify-between text-gray-400">
+                                <span>Addr: {addr}</span>
+                                <span className="font-bold text-green-400">{val} (Dec)</span>
+                            </div>
+                            <div className="text-xs text-blue-500/80 tracking-widest break-all">
+                                {toBinary32(val)}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
         </div>
 
-        {/* COL 3: Memory & Log */}
-        <div className="flex flex-col gap-2 w-1/4 min-w-[200px]">
-          <Section title="Memory" icon={Database} className="flex-1">
-            <div className="font-mono space-y-1">
-              {Object.entries(state.memoryValues).map(([addr, val]) => (
-                <div
-                  key={addr}
-                  className="flex justify-between border-b border-gray-800"
-                >
-                  <span className="text-gray-500">M[{addr}]</span>
-                  <span className="text-blue-300">{val}</span>
-                </div>
-              ))}
-            </div>
-          </Section>
-          <Section title="Log" icon={AlertCircle} className="flex-[2]">
-            <div className="font-mono text-[10px] space-y-1">
-              {state.log.map((l, i) => (
-                <div key={i} className="border-l-2 border-gray-700 pl-1">
-                  {l}
-                </div>
-              ))}
-            </div>
-          </Section>
-        </div>
       </div>
     </div>
   );
